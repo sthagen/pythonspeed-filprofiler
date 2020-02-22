@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8a70f0f05390d0c4d8a739b45c3b520e75188def9067fdbb83d9f7aaadd9f122 # shrinks to allocated_sizes = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1], free_indices = [Index(3689348814741910324), Index(0), Index(3689348814741910324), Index(0), Index(0)]
