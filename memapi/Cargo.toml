@@ -24,6 +24,9 @@ features = ["ffi"]
 [dev-dependencies]
 proptest = "0.9.5"
 
+[build-dependencies]
+cc = "1.0"
+
 [lib]
 name = "pymemprofile_api"
 crate_type = ["cdylib"]
