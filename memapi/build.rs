@@ -1,6 +1,10 @@
 use cc;
+use std::env;
 
 fn main() {
+    let out_dir = env::var("OUT_DIR").unwrap();
+    println!("cargo:rerun-if-changed=src/filpreload.c");
+    println!("cargo:rustc-link-search=native={}", out_dir);
     cc::Build::new()
         .file("src/filpreload.c")
         .warnings_into_errors(true)
@@ -8,6 +12,9 @@ fn main() {
         .flag("-Wall")
         .flag("-Werror=format-security")
         .flag("-Werror=implicit-function-declaration")
+        .static_flag(true)
+        .shared_flag(false)
+        .flag("-fvisibility=hidden")
+        .cargo_metadata(false)
         .compile("filpreload");
-    println!("cargo:rerun-if-changed=src/filpreload.c");
 }

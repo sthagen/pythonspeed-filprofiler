@@ -51,5 +51,13 @@ pub unsafe extern "C" fn pymemprofile_dump_peak_to_flamegraph(path: *const c_cha
     memorytracking::dump_peak_to_flamegraph(&path);
 }
 
+// Re-export symbols from filpreload.c
+#[link(name = "filpreload", kind = "static")]
+extern "C" {
+    pub fn malloc(size: libc::size_t) -> *mut libc::c_void;
+    pub fn free(addr: *mut libc::c_void);
+    pub fn fil_dump_peak_to_flamegraph(path: *const c_char);
+}
+
 #[cfg(test)]
 mod tests {}

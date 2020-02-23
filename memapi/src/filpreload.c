@@ -11,10 +11,6 @@ static void *(*underlying_real_mmap)(void *addr, size_t length, int prot,
                                      int flags, int fd, off_t offset) = 0;
 static void (*underlying_real_free)(void *addr) = 0;
 
-// The internal API we're notifying of allocations:
-static void (*add_allocation_hook)(size_t address, size_t length) = 0;
-static void (*free_allocation_hook)(size_t address) = 0;
-
 // Note whether we've been initialized yet or not:
 static int initialized = 0;
 
@@ -27,23 +23,6 @@ static void __attribute__((constructor)) constructor() {
   unsetenv("LD_PRELOAD");
   if (sizeof((void *)0) != sizeof((size_t)0)) {
     fprintf(stderr, "BUG: expected size of size_t and void* to be the same.\n");
-    exit(1);
-  }
-  void *lib =
-      dlopen(getenv("FIL_API_LIBRARY"), RTLD_NOW | RTLD_DEEPBIND | RTLD_GLOBAL);
-  if (!lib) {
-    fprintf(stderr, "Couldn't load libpymemprofile_api.so library: %s\n",
-            dlerror());
-    exit(1);
-  }
-  add_allocation_hook = dlsym(lib, "pymemprofile_add_allocation");
-  if (!add_allocation_hook) {
-    fprintf(stderr, "Couldn't load pymemprofile API function: %s\n", dlerror());
-    exit(1);
-  }
-  free_allocation_hook = dlsym(lib, "pymemprofile_free_allocation");
-  if (!free_allocation_hook) {
-    fprintf(stderr, "Couldn't load pymemprofile API function: %s\n", dlerror());
     exit(1);
   }
   underlying_real_mmap = dlsym(RTLD_NEXT, "mmap");
@@ -61,10 +40,14 @@ static void __attribute__((constructor)) constructor() {
 
 extern void *__libc_malloc(size_t size);
 extern void *__libc_calloc(size_t nmemb, size_t size);
+
+// The Rust API in lib.rs:
+extern void pymemprofile_add_allocation(size_t address, size_t length);
+extern void pymemprofile_free_allocation(size_t address);
 extern void pymemprofile_start_call(const char *filename, const char *funcname);
 extern void pymemprofile_finish_call();
 extern void pymemprofile_reset();
-extern void pymemprofile_dump_peak_to_flamegraph(const char* path);
+extern void pymemprofile_dump_peak_to_flamegraph(const char *path);
 
 __attribute__((visibility("default"))) void
 fil_start_call(const char *filename, const char *funcname) {
@@ -91,7 +74,8 @@ __attribute__((visibility("default"))) void fil_reset() {
   }
 }
 
-__attribute__((visibility("default"))) void fil_dump_peak_to_flamegraph(const char* path) {
+__attribute__((visibility("default"))) void
+fil_dump_peak_to_flamegraph(const char *path) {
   if (!will_i_be_reentrant) {
     will_i_be_reentrant = 1;
     pymemprofile_dump_peak_to_flamegraph(path);
@@ -104,7 +88,7 @@ __attribute__((visibility("default"))) void *malloc(size_t size) {
   void *result = __libc_malloc(size);
   if (!will_i_be_reentrant && initialized) {
     will_i_be_reentrant = 1;
-    add_allocation_hook((size_t)result, size);
+    pymemprofile_add_allocation((size_t)result, size);
     will_i_be_reentrant = 0;
   }
   return result;
@@ -115,7 +99,7 @@ __attribute__((visibility("default"))) void *calloc(size_t nmemb, size_t size) {
   size_t allocated = nmemb * size;
   if (!will_i_be_reentrant && initialized) {
     will_i_be_reentrant = 1;
-    add_allocation_hook((size_t)result, allocated);
+    pymemprofile_add_allocation((size_t)result, allocated);
     will_i_be_reentrant = 0;
   }
   return result;
@@ -129,7 +113,7 @@ __attribute__((visibility("default"))) void free(void *addr) {
   underlying_real_free(addr);
   if (!will_i_be_reentrant) {
     will_i_be_reentrant = 1;
-    free_allocation_hook((size_t)addr);
+    pymemprofile_free_allocation((size_t)addr);
     will_i_be_reentrant = 0;
   }
 }

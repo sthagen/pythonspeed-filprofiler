@@ -22,8 +22,8 @@ def stage_1():
     # Route all allocations from Python through malloc() directly:
     environ["PYTHONMALLOC"] = "malloc"
     # Library setup:
-    environ["LD_PRELOAD"] = library_path("_filpreload")
-    environ["FIL_API_LIBRARY"] = library_path("libpymemprofile_api")
+    environ["LD_PRELOAD"] = library_path("libpymemprofile_api")
+
     # Disable multi-threaded backends in various scientific computing libraries
     # (Zarr uses Blosc, NumPy uses BLAS):
     environ["BLOSC_NTHREADS"] = "1"
