@@ -2,9 +2,6 @@ use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::str;
 
-#[macro_use]
-extern crate lazy_static;
-
 mod memorytracking;
 
 #[no_mangle]

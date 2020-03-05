@@ -1,3 +1,4 @@
+use crossbeam_channel;
 use im::hashmap as imhashmap;
 use inferno::flamegraph;
 use itertools::Itertools;
@@ -11,6 +12,7 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
+use std::thread::ThreadId;
 
 type FunctionId = u32;
 
@@ -81,7 +83,46 @@ impl Callstack {
     }
 }
 
-thread_local!(static THREAD_CALLSTACK: RefCell<Callstack> = RefCell::new(Callstack::new()));
+struct PerThreadCallStacks {
+    threads: HashMap<ThreadId, CallStack>,
+}
+
+impl PerThreadCallStacks {
+    fn new() -> Self {
+        PerThreadCallStacks {
+            threads: HashMap::new(),
+        }
+    }
+
+    fn get_callstack(&mut self, thread_id: ThreadId) -> &mut CallStack {
+        self.threads
+            .entry(thread_id)
+            .or_insert_with(|| CallStack::new())
+    }
+
+    fn clone_for_thread(&mut self, thread_id: ThreadId) -> CallStack {
+        self.get_callstack().clone()
+    }
+
+    fn start_call(
+        &mut self,
+        thread_id: ThreadId,
+        call_site: Function,
+        parent_line_number: u16,
+        line_number: u16,
+    ) {
+        self.get_callstack(thread_id)
+            .start_call(call_site, parent_line_number, line_number);
+    }
+
+    fn finish_call(&mut self, thread_id: ThreadId) {
+        self.get_callstack(thread_id).finish_call();
+    }
+
+    fn new_line_number(&mut self, thread_id: ThreadId, line_number: u16) {
+        self.get_callstack(thread_id).new_line_number(line_number);
+    }
+}
 
 /// A particular place where a call happened.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -274,8 +315,73 @@ impl<'a> AllocationTracker {
     }
 }
 
-lazy_static! {
-    static ref ALLOCATIONS: Mutex<AllocationTracker> = Mutex::new(AllocationTracker::new());
+enum Command {
+    StartCall {
+        thread_id: ThreadId,
+        call_site: Function,
+        parent_line_number: u16,
+        line_number: u16,
+    },
+    FinishCall {
+        thread_id: ThreadId,
+    },
+    NewLineNumberForCall {
+        thread_id: ThreadId,
+        line_number: u16,
+    },
+    AddAllocation {
+        thread_id: ThreadId,
+        address: usize,
+        size: libc::size_t,
+        line_number: u16,
+    },
+    FreeAllocation {
+        address: usize,
+    },
+    Reset,
+    DumpPeakToFlameGraph {
+        path: String,
+    },
+}
+
+static COMMAND_SENDER: Lazy<crossbeam_channel::Sender<Command>> = Lazy::new(|| {
+    let (s, r) = crossbeam_channel::unbounded();
+    thread::spawn(move || process_commands(r));
+    s
+});
+
+/// Runs in a thread, processes Commands from other threads
+/// TODO register so malloc() doesn't recursively get added
+/// TODO switch to im-rc
+/// TODO switch hashmap to refpool
+fn process_commands(receiver: crossbeam_channel::Receiver<Command>) {
+    let allocations = AllocationTracker::new();
+    let callstacks = PerThreadCallStack::new();
+    while true {
+        if let Ok(command) = receiver.recv() {
+            match command {
+                AddAllocation(thread_id, address, size, linue_number) => {
+                    let callstack = callstacks.clone_for_thread(thread_id);
+                    allocations.add_allocation(address, size, callstack);
+                }
+                FreeAllocation(address) => {
+                    allocations.free_allocation(address);
+                }
+                StartCall(thread_id, call_site, parent_line_number, number) => {
+                    callstacks.start_call(thread_id, call_site, parent_line_number, number)
+                }
+                FinishCall(thread_id) => callstacks.finish_call(thread_id),
+                NewLineNumberForCall(thread_id, line_number) => {
+                    callstacks.new_line_number(thread_id, line_number)
+                }
+                Reset() => allocations.reset(),
+                DumpPeakToFlameGraph(path) => allocations.dump_peak_to_flamegraph(path),
+            }
+        } else {
+            // Shouldn't ever happen, but just in case.
+            return;
+        }
+    }
 }
 
 /// Add to per-thread function stack:
