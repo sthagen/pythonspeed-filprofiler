@@ -5,13 +5,12 @@ use itertools::Itertools;
 use libc;
 use rustc_hash::FxHashMap as HashMap;
 use smallstr::SmallString;
-use std::cell::RefCell;
 use std::collections;
 use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::sync::Mutex;
+use std::thread;
 use std::thread::ThreadId;
 
 type FunctionId = u32;
@@ -84,35 +83,38 @@ impl Callstack {
 }
 
 struct PerThreadCallStacks {
-    threads: HashMap<ThreadId, CallStack>,
+    threads: HashMap<ThreadId, Callstack>,
 }
 
 impl PerThreadCallStacks {
     fn new() -> Self {
         PerThreadCallStacks {
-            threads: HashMap::new(),
+            threads: HashMap::default(),
         }
     }
 
-    fn get_callstack(&mut self, thread_id: ThreadId) -> &mut CallStack {
+    fn get_callstack(&mut self, thread_id: ThreadId) -> &mut Callstack {
         self.threads
             .entry(thread_id)
-            .or_insert_with(|| CallStack::new())
+            .or_insert_with(|| Callstack::new())
     }
 
-    fn clone_for_thread(&mut self, thread_id: ThreadId) -> CallStack {
-        self.get_callstack().clone()
+    fn clone_for_thread(&mut self, thread_id: ThreadId, line_number: u16) -> Callstack {
+        let callstack = self.get_callstack(thread_id).clone();
+        if line_number != 0 && !callstack.calls.is_empty() {
+            callstack.new_line_number(line_number);
+        }
+        callstack
     }
 
     fn start_call(
         &mut self,
         thread_id: ThreadId,
-        call_site: Function,
+        callsite_id: CallSiteId,
         parent_line_number: u16,
-        line_number: u16,
     ) {
         self.get_callstack(thread_id)
-            .start_call(call_site, parent_line_number, line_number);
+            .start_call(parent_line_number, callsite_id);
     }
 
     fn finish_call(&mut self, thread_id: ThreadId) {
@@ -325,10 +327,6 @@ enum Command {
     FinishCall {
         thread_id: ThreadId,
     },
-    NewLineNumberForCall {
-        thread_id: ThreadId,
-        line_number: u16,
-    },
     AddAllocation {
         thread_id: ThreadId,
         address: usize,
@@ -344,98 +342,112 @@ enum Command {
     },
 }
 
-static COMMAND_SENDER: Lazy<crossbeam_channel::Sender<Command>> = Lazy::new(|| {
-    let (s, r) = crossbeam_channel::unbounded();
-    thread::spawn(move || process_commands(r));
-    s
-});
+pub struct CommandProcessor {
+    sender: crossbeam_channel::Sender<Command>,
+}
 
-/// Runs in a thread, processes Commands from other threads
-/// TODO register so malloc() doesn't recursively get added
-/// TODO switch to im-rc
-/// TODO switch hashmap to refpool
-fn process_commands(receiver: crossbeam_channel::Receiver<Command>) {
-    let allocations = AllocationTracker::new();
-    let callstacks = PerThreadCallStack::new();
-    while true {
-        if let Ok(command) = receiver.recv() {
-            match command {
-                AddAllocation(thread_id, address, size, linue_number) => {
-                    let callstack = callstacks.clone_for_thread(thread_id);
-                    allocations.add_allocation(address, size, callstack);
+/// A little suspicious of default implementation, so might want to use my own
+fn get_thread_id() -> ThreadId {
+    thread::current().id()
+}
+
+impl CommandProcessor {
+    pub fn new() -> Self {
+        let (s, r) = crossbeam_channel::unbounded();
+        thread::spawn(move || Self::process_commands(r));
+        Self { sender: s }
+    }
+
+    /// Runs in a thread, processes Commands from other threads
+    /// TODO register so malloc() doesn't recursively get added
+    /// TODO switch to im-rc
+    /// TODO switch hashmap to refpool
+    fn process_commands(receiver: crossbeam_channel::Receiver<Command>) {
+        let allocations = AllocationTracker::new();
+        let callstacks = PerThreadCallStacks::new();
+        loop {
+            if let Ok(command) = receiver.recv() {
+                match command {
+                    Command::AddAllocation {
+                        thread_id,
+                        address,
+                        size,
+                        line_number,
+                    } => {
+                        let callstack = callstacks.clone_for_thread(thread_id, line_number);
+                        allocations.add_allocation(address, size, callstack);
+                    }
+                    Command::FreeAllocation { address } => {
+                        allocations.free_allocation(address);
+                    }
+                    Command::StartCall {
+                        thread_id,
+                        call_site,
+                        parent_line_number,
+                        line_number,
+                    } => {
+                        let function_id = allocations.call_sites.get_or_insert_id(call_site);
+                        let callsite_id = CallSiteId::new(function_id, line_number);
+                        callstacks.start_call(thread_id, callsite_id, parent_line_number);
+                    }
+                    Command::FinishCall { thread_id } => callstacks.finish_call(thread_id),
+                    Command::Reset => {
+                        allocations = AllocationTracker::new();
+                    }
+                    Command::DumpPeakToFlameGraph { path } => {
+                        allocations.dump_peak_to_flamegraph(&path)
+                    }
                 }
-                FreeAllocation(address) => {
-                    allocations.free_allocation(address);
-                }
-                StartCall(thread_id, call_site, parent_line_number, number) => {
-                    callstacks.start_call(thread_id, call_site, parent_line_number, number)
-                }
-                FinishCall(thread_id) => callstacks.finish_call(thread_id),
-                NewLineNumberForCall(thread_id, line_number) => {
-                    callstacks.new_line_number(thread_id, line_number)
-                }
-                Reset() => allocations.reset(),
-                DumpPeakToFlameGraph(path) => allocations.dump_peak_to_flamegraph(path),
+            } else {
+                return;
             }
-        } else {
-            // Shouldn't ever happen, but just in case.
-            return;
         }
     }
-}
 
-/// Add to per-thread function stack:
-pub fn start_call(call_site: Function, parent_line_number: u16, line_number: u16) {
-    let mut allocations = ALLOCATIONS.lock().unwrap();
-    let function_id = allocations.call_sites.get_or_insert_id(call_site);
-    THREAD_CALLSTACK.with(|cs| {
-        cs.borrow_mut().start_call(
+    /// Add to per-thread function stack:
+    pub fn start_call(&mut self, call_site: Function, parent_line_number: u16, line_number: u16) {
+        self.sender.send(Command::StartCall {
+            thread_id: get_thread_id(),
+            call_site,
             parent_line_number,
-            CallSiteId::new(function_id, line_number),
-        );
-    });
-}
-
-/// Finish off (and move to reporting structure) current function in function
-/// stack.
-pub fn finish_call() {
-    THREAD_CALLSTACK.with(|cs| {
-        cs.borrow_mut().finish_call();
-    });
-}
-
-/// Change line number on current function in per-thread function stack:
-pub fn new_line_number(line_number: u16) {
-    THREAD_CALLSTACK.with(|cs| {
-        cs.borrow_mut().new_line_number(line_number);
-    });
-}
-
-/// Add a new allocation based off the current callstack.
-pub fn add_allocation(address: usize, size: libc::size_t, line_number: u16) {
-    let mut callstack: Callstack = THREAD_CALLSTACK.with(|cs| (*cs.borrow()).clone());
-    if line_number != 0 && !callstack.calls.is_empty() {
-        callstack.new_line_number(line_number);
+            line_number,
+        });
     }
-    let mut allocations = ALLOCATIONS.lock().unwrap();
-    allocations.add_allocation(address, size, callstack);
-}
 
-/// Free an existing allocation.
-pub fn free_allocation(address: usize) {
-    let mut allocations = ALLOCATIONS.lock().unwrap();
-    allocations.free_allocation(address);
-}
+    /// Finish off (and move to reporting structure) current function in function
+    /// stack.
+    pub fn finish_call(&mut self) {
+        self.sender.send(Command::FinishCall {
+            thread_id: get_thread_id(),
+        });
+    }
 
-/// Reset internal state.
-pub fn reset() {
-    *ALLOCATIONS.lock().unwrap() = AllocationTracker::new();
-}
+    /// Add a new allocation based off the current callstack.
+    pub fn add_allocation(&mut self, address: usize, size: libc::size_t, line_number: u16) {
+        self.sender.send(Command::AddAllocation {
+            thread_id: get_thread_id(),
+            address,
+            size,
+            line_number,
+        });
+    }
 
-/// Dump all callstacks in peak memory usage to format used by flamegraph.
-pub fn dump_peak_to_flamegraph(path: &str) {
-    let allocations = &ALLOCATIONS.lock().unwrap();
-    allocations.dump_peak_to_flamegraph(path);
+    /// Free an existing allocation.
+    pub fn free_allocation(&mut self, address: usize) {
+        self.sender.send(Command::FreeAllocation { address });
+    }
+
+    /// Reset internal state.
+    pub fn reset(&mut self) {
+        self.sender.send(Command::Reset);
+    }
+
+    /// Dump all callstacks in peak memory usage to format used by flamegraph.
+    pub fn dump_peak_to_flamegraph(&mut self, path: &str) {
+        self.sender.send(Command::DumpPeakToFlameGraph {
+            path: path.to_string(),
+        });
+    }
 }
 
 /// Write strings to disk, one line per string.
