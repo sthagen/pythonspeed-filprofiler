@@ -99,7 +99,7 @@ impl PerThreadCallStacks {
     }
 
     fn clone_for_thread(&mut self, thread_id: ThreadId, line_number: u16) -> Callstack {
-        let callstack = self.get_callstack(thread_id).clone();
+        let mut callstack = self.get_callstack(thread_id).clone();
         if line_number != 0 && !callstack.calls.is_empty() {
             callstack.new_line_number(line_number);
         }
@@ -118,10 +118,6 @@ impl PerThreadCallStacks {
 
     fn finish_call(&mut self, thread_id: ThreadId) {
         self.get_callstack(thread_id).finish_call();
-    }
-
-    fn new_line_number(&mut self, thread_id: ThreadId, line_number: u16) {
-        self.get_callstack(thread_id).new_line_number(line_number);
     }
 }
 
@@ -341,6 +337,7 @@ enum Command {
     },
 }
 
+/// Run AllocationTracker in a thread.
 pub struct CommandProcessor {
     sender: crossbeam_channel::Sender<Command>,
 }
@@ -362,8 +359,8 @@ impl CommandProcessor {
     /// TODO switch to im-rc
     /// TODO switch hashmap to refpool
     fn process_commands(receiver: crossbeam_channel::Receiver<Command>) {
-        let allocations = AllocationTracker::new();
-        let callstacks = PerThreadCallStacks::new();
+        let mut allocations = AllocationTracker::new();
+        let mut callstacks = PerThreadCallStacks::new();
         loop {
             if let Ok(command) = receiver.recv() {
                 match command {
@@ -404,48 +401,58 @@ impl CommandProcessor {
     }
 
     /// Add to per-thread function stack:
-    pub fn start_call(&mut self, call_site: Function, parent_line_number: u16, line_number: u16) {
-        self.sender.send(Command::StartCall {
-            thread_id: get_thread_id(),
-            call_site,
-            parent_line_number,
-            line_number,
-        });
+    pub fn start_call(&self, call_site: Function, parent_line_number: u16, line_number: u16) {
+        self.sender
+            .send(Command::StartCall {
+                thread_id: get_thread_id(),
+                call_site,
+                parent_line_number,
+                line_number,
+            })
+            .unwrap();
     }
 
     /// Finish off (and move to reporting structure) current function in function
     /// stack.
-    pub fn finish_call(&mut self) {
-        self.sender.send(Command::FinishCall {
-            thread_id: get_thread_id(),
-        });
+    pub fn finish_call(&self) {
+        self.sender
+            .send(Command::FinishCall {
+                thread_id: get_thread_id(),
+            })
+            .unwrap();
     }
 
     /// Add a new allocation based off the current callstack.
-    pub fn add_allocation(&mut self, address: usize, size: libc::size_t, line_number: u16) {
-        self.sender.send(Command::AddAllocation {
-            thread_id: get_thread_id(),
-            address,
-            size,
-            line_number,
-        });
+    pub fn add_allocation(&self, address: usize, size: libc::size_t, line_number: u16) {
+        self.sender
+            .send(Command::AddAllocation {
+                thread_id: get_thread_id(),
+                address,
+                size,
+                line_number,
+            })
+            .unwrap();
     }
 
     /// Free an existing allocation.
-    pub fn free_allocation(&mut self, address: usize) {
-        self.sender.send(Command::FreeAllocation { address });
+    pub fn free_allocation(&self, address: usize) {
+        self.sender
+            .send(Command::FreeAllocation { address })
+            .unwrap();
     }
 
     /// Reset internal state.
-    pub fn reset(&mut self) {
-        self.sender.send(Command::Reset);
+    pub fn reset(&self) {
+        self.sender.send(Command::Reset).unwrap();
     }
 
     /// Dump all callstacks in peak memory usage to format used by flamegraph.
-    pub fn dump_peak_to_flamegraph(&mut self, path: &str) {
-        self.sender.send(Command::DumpPeakToFlameGraph {
-            path: path.to_string(),
-        });
+    pub fn dump_peak_to_flamegraph(&self, path: &str) {
+        self.sender
+            .send(Command::DumpPeakToFlameGraph {
+                path: path.to_string(),
+            })
+            .unwrap();
     }
 }
 
