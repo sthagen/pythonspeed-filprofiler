@@ -69,7 +69,6 @@ impl Callstack {
         } else {
             self.calls
                 .iter()
-                // TODO include line number in output
                 .map(|id| {
                     let function = id_to_callsite.get(&id.function_id).unwrap();
                     format!(
