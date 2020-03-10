@@ -2,10 +2,10 @@ use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::str;
 
+mod memorytracking;
+
 #[macro_use]
 extern crate lazy_static;
-
-mod memorytracking;
 
 #[no_mangle]
 pub extern "C" fn pymemprofile_add_allocation(

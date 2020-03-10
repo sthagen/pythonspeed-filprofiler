@@ -12,6 +12,31 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
 
+use std::fs::File;
+use std::io::{self, BufRead};
+
+pub struct LineCache {}
+
+impl LineCache {
+    pub fn new() -> Self {
+        LineCache {}
+    }
+
+    fn get_line(&self, filepath: &str, line_number: usize) -> Option<String> {
+        if let Ok(file) = File::open(filepath) {
+            let mut lines = io::BufReader::new(file).lines();
+            // In source code line numbers are 1-indexed, but not here:
+            if let Some(Ok(value)) = lines.nth(line_number - 1) {
+                Some(value)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+}
+
 type FunctionId = u32;
 
 /// A specific location: file + function + line number.
@@ -68,13 +93,21 @@ impl Callstack {
         } else {
             self.calls
                 .iter()
-                // TODO include line number in output
                 .map(|id| {
                     let function = id_to_callsite.get(&id.function_id).unwrap();
-                    format!(
+                    // TODO make it a real cache
+                    // TODO remove sys.path prefix from filenames
+                    // TODO use non-text-based API
+                    let result = format!(
                         "{}:{} ({})",
                         &function.file_name, id.line_number, &function.function_name
-                    )
+                    );
+                    /*
+                    let lc = LineCache::new();
+                    if let Some(line) = lc.get_line(&function.file_name, id.line_number as usize) {
+                        format!("{};{}", result, &line.replace(";", "⚺").trim())
+                    }*/
+                    result
                 })
                 .join(";")
         }
