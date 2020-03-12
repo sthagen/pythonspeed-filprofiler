@@ -1,7 +1,7 @@
-use im::hashmap as imhashmap;
 use inferno::flamegraph;
 use itertools::Itertools;
 use libc;
+use rpds;
 use rustc_hash::FxHashMap as HashMap;
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -158,8 +158,8 @@ struct Allocation {
 
 /// The main data structure tracking everything.
 struct AllocationTracker {
-    current_allocations: imhashmap::HashMap<usize, Allocation>,
-    peak_allocations: imhashmap::HashMap<usize, Allocation>,
+    current_allocations: rpds::HashTrieMap<usize, Allocation>,
+    peak_allocations: rpds::HashTrieMap<usize, Allocation>,
     current_allocated_bytes: usize,
     peak_allocated_bytes: usize,
     call_sites: FunctionTracker,
@@ -168,8 +168,8 @@ struct AllocationTracker {
 impl<'a> AllocationTracker {
     fn new() -> AllocationTracker {
         AllocationTracker {
-            current_allocations: imhashmap::HashMap::default(),
-            peak_allocations: imhashmap::HashMap::default(),
+            current_allocations: rpds::HashTrieMap::default(),
+            peak_allocations: rpds::HashTrieMap::default(),
             current_allocated_bytes: 0,
             peak_allocated_bytes: 0,
             call_sites: FunctionTracker::new(),
@@ -179,7 +179,7 @@ impl<'a> AllocationTracker {
     /// Add a new allocation based off the current callstack.
     fn add_allocation(&mut self, address: usize, size: libc::size_t, callstack: Callstack) {
         let alloc = Allocation { callstack, size };
-        self.current_allocations.insert(address, alloc);
+        self.current_allocations.insert_mut(address, alloc);
         self.current_allocated_bytes += size;
         if self.current_allocated_bytes > self.peak_allocated_bytes {
             self.peak_allocated_bytes = self.current_allocated_bytes;
@@ -190,12 +190,14 @@ impl<'a> AllocationTracker {
     /// Free an existing allocation.
     fn free_allocation(&mut self, address: usize) {
         // Possibly this allocation doesn't exist; that's OK!
-        if let Some(removed) = self.current_allocations.remove(&address) {
-            if removed.size > self.current_allocated_bytes {
+        if let Some(removed) = self.current_allocations.get(&address) {
+            let size = removed.size;
+            self.current_allocations.remove_mut(&address);
+            if size > self.current_allocated_bytes {
                 // In theory this should never happen, but just in case...
                 self.current_allocated_bytes = 0;
             } else {
-                self.current_allocated_bytes -= removed.size;
+                self.current_allocated_bytes -= size;
             }
         }
     }
@@ -282,6 +284,8 @@ impl<'a> AllocationTracker {
         }
     }
 }
+
+unsafe impl Send for AllocationTracker {}
 
 lazy_static! {
     static ref ALLOCATIONS: Mutex<AllocationTracker> = Mutex::new(AllocationTracker::new());
