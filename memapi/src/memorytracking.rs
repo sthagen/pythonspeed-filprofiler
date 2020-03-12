@@ -2,6 +2,7 @@ use im::hashmap as imhashmap;
 use inferno::flamegraph;
 use itertools::Itertools;
 use libc;
+use parking_lot::Mutex;
 use rustc_hash::FxHashMap as HashMap;
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -10,7 +11,6 @@ use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::sync::Mutex;
 
 type FunctionId = u32;
 
@@ -158,8 +158,8 @@ struct Allocation {
 
 /// The main data structure tracking everything.
 struct AllocationTracker {
-    current_allocations: imhashmap::HashMap<usize, Allocation>,
-    peak_allocations: imhashmap::HashMap<usize, Allocation>,
+    current_allocations: HashMap<usize, Allocation>,
+    peak_allocations: HashMap<usize, Allocation>,
     current_allocated_bytes: usize,
     peak_allocated_bytes: usize,
     call_sites: FunctionTracker,
@@ -167,13 +167,15 @@ struct AllocationTracker {
 
 impl<'a> AllocationTracker {
     fn new() -> AllocationTracker {
-        AllocationTracker {
-            current_allocations: imhashmap::HashMap::default(),
-            peak_allocations: imhashmap::HashMap::default(),
+        let mut result = AllocationTracker {
+            current_allocations: HashMap::default(),
+            peak_allocations: HashMap::default(),
             current_allocated_bytes: 0,
             peak_allocated_bytes: 0,
             call_sites: FunctionTracker::new(),
-        }
+        };
+        result.current_allocations.reserve(10000);
+        result
     }
 
     /// Add a new allocation based off the current callstack.
@@ -181,14 +183,18 @@ impl<'a> AllocationTracker {
         let alloc = Allocation { callstack, size };
         self.current_allocations.insert(address, alloc);
         self.current_allocated_bytes += size;
+    }
+
+    fn check_for_peak(&mut self) {
         if self.current_allocated_bytes > self.peak_allocated_bytes {
             self.peak_allocated_bytes = self.current_allocated_bytes;
-            self.peak_allocations = self.current_allocations.clone();
+            self.peak_allocations.clone_from(&self.current_allocations);
         }
     }
 
     /// Free an existing allocation.
     fn free_allocation(&mut self, address: usize) {
+        self.check_for_peak();
         // Possibly this allocation doesn't exist; that's OK!
         if let Some(removed) = self.current_allocations.remove(&address) {
             if removed.size > self.current_allocated_bytes {
@@ -202,7 +208,8 @@ impl<'a> AllocationTracker {
 
     /// Combine Callstacks and make them human-readable. Duplicate callstacks
     /// have their allocated memory summed.
-    fn combine_callstacks(&self) -> collections::HashMap<String, usize> {
+    fn combine_callstacks(&mut self) -> collections::HashMap<String, usize> {
+        self.check_for_peak();
         let mut by_call: collections::HashMap<String, usize> = collections::HashMap::new();
         let peak_allocations = &self.peak_allocations;
         let id_to_callsite = self.call_sites.get_reverse_map();
@@ -216,7 +223,7 @@ impl<'a> AllocationTracker {
 
     /// Dump all callstacks in peak memory usage to various files describing the
     /// memory usage.
-    fn dump_peak_to_flamegraph(&self, path: &str) {
+    fn dump_peak_to_flamegraph(&mut self, path: &str) {
         eprintln!("=fil-profile= Preparing to write to {}", path);
         let directory_path = Path::new(path);
         if !directory_path.exists() {
@@ -289,7 +296,7 @@ lazy_static! {
 
 /// Add to per-thread function stack:
 pub fn start_call(call_site: Function<'static>, parent_line_number: u16, line_number: u16) {
-    let mut allocations = ALLOCATIONS.lock().unwrap();
+    let mut allocations = ALLOCATIONS.lock();
     let function_id = allocations.call_sites.get_or_insert_id(call_site);
     THREAD_CALLSTACK.with(|cs| {
         cs.borrow_mut().start_call(
@@ -320,24 +327,24 @@ pub fn add_allocation(address: usize, size: libc::size_t, line_number: u16) {
     if line_number != 0 && !callstack.calls.is_empty() {
         callstack.new_line_number(line_number);
     }
-    let mut allocations = ALLOCATIONS.lock().unwrap();
+    let mut allocations = ALLOCATIONS.lock();
     allocations.add_allocation(address, size, callstack);
 }
 
 /// Free an existing allocation.
 pub fn free_allocation(address: usize) {
-    let mut allocations = ALLOCATIONS.lock().unwrap();
+    let mut allocations = ALLOCATIONS.lock();
     allocations.free_allocation(address);
 }
 
 /// Reset internal state.
 pub fn reset() {
-    *ALLOCATIONS.lock().unwrap() = AllocationTracker::new();
+    *ALLOCATIONS.lock() = AllocationTracker::new();
 }
 
 /// Dump all callstacks in peak memory usage to format used by flamegraph.
 pub fn dump_peak_to_flamegraph(path: &str) {
-    let allocations = &ALLOCATIONS.lock().unwrap();
+    let allocations = &mut ALLOCATIONS.lock();
     allocations.dump_peak_to_flamegraph(path);
 }
 
