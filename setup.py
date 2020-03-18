@@ -7,7 +7,6 @@ setup(
     ext_modules=[
         Extension("filprofiler._profiler", sources=["filprofiler/_profiler.c"],)
     ],
-    scripts=["filprofiler/fil-python"],
     entry_points={"console_scripts": ["fil-profile=filprofiler._script:stage_1"],},
     package_data={
         "filprofiler": [
