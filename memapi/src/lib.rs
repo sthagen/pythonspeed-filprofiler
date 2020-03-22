@@ -25,6 +25,7 @@ pub extern "C" fn pymemprofile_free_allocation(address: usize) {
 /// Intended for use from C APIs, what can I say.
 #[no_mangle]
 pub unsafe extern "C" fn pymemprofile_start_call(
+    code_id: usize,
     parent_line_number: u16,
     file_name: *const c_char,
     func_name: *const c_char,
@@ -32,8 +33,8 @@ pub unsafe extern "C" fn pymemprofile_start_call(
 ) {
     let function_name = str::from_utf8_unchecked(CStr::from_ptr(func_name).to_bytes());
     let module_name = str::from_utf8_unchecked(CStr::from_ptr(file_name).to_bytes());
-    let call_site = memorytracking::Function::new(module_name, function_name);
-    memorytracking::start_call(call_site, parent_line_number, line_number);
+    let function = memorytracking::Function::new(module_name, function_name);
+    memorytracking::start_call(code_id, function, parent_line_number, line_number);
 }
 
 #[no_mangle]

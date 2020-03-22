@@ -54,7 +54,7 @@ int main(int argc, char **argv) {
 
 extern void *__libc_malloc(size_t size);
 extern void *__libc_calloc(size_t nmemb, size_t size);
-extern void pymemprofile_start_call(uint16_t parent_line_number,
+extern void pymemprofile_start_call(size_t code_id, uint16_t parent_line_number,
                                     const char *filename, const char *funcname,
                                     uint16_t line_number);
 extern void pymemprofile_finish_call();
@@ -66,7 +66,7 @@ extern void pymemprofile_add_allocation(size_t address, size_t length,
 extern void pymemprofile_free_allocation(size_t address);
 
 __attribute__((visibility("default"))) void
-fil_start_call(const char *filename, const char *funcname,
+fil_start_call(size_t code_id, const char *filename, const char *funcname,
                uint16_t line_number) {
   if (!will_i_be_reentrant) {
     will_i_be_reentrant = 1;
@@ -76,7 +76,7 @@ fil_start_call(const char *filename, const char *funcname,
       parent_line_number = PyCode_Addr2Line(f->f_code, f->f_lasti);
     }
 
-    pymemprofile_start_call(parent_line_number, filename, funcname,
+    pymemprofile_start_call(code_id, parent_line_number, filename, funcname,
                             line_number);
     will_i_be_reentrant = 0;
   }
@@ -174,7 +174,11 @@ fil_tracer(PyObject *obj, PyFrameObject *frame, int what, PyObject *arg) {
   switch (what) {
   case PyTrace_CALL:
     current_frame = frame;
-    fil_start_call(PyUnicode_AsUTF8(frame->f_code->co_filename),
+    // Most of the time code objects will be reused, so the pointer address of
+    // the code object is a good optimization hint for figuring out which
+    // function this is. We don't rely on it, though.
+    fil_start_call((size_t)frame->f_code,
+                   PyUnicode_AsUTF8(frame->f_code->co_filename),
                    PyUnicode_AsUTF8(frame->f_code->co_name), frame->f_lineno);
     break;
   case PyTrace_RETURN:

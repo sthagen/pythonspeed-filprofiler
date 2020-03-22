@@ -3,9 +3,11 @@ use inferno::flamegraph;
 use itertools::Itertools;
 use libc;
 use rustc_hash::FxHashMap as HashMap;
+use smallvec::{smallvec, SmallVec};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections;
+use std::collections::hash_map::Entry;
 use std::fmt;
 use std::fs;
 use std::io::Write;
@@ -111,7 +113,7 @@ impl<'a> fmt::Display for Function<'a> {
 /// Maps Functions to integer identifiers used in CallStacks.
 struct FunctionTracker {
     max_id: FunctionId,
-    function_to_id: HashMap<Function<'static>, FunctionId>,
+    function_to_id: HashMap<usize, SmallVec<[(Function<'static>, FunctionId); 1]>>,
 }
 
 impl<'a> FunctionTracker {
@@ -122,19 +124,40 @@ impl<'a> FunctionTracker {
         }
     }
 
-    /// Add a (possibly) new Function, returning its ID.
-    fn get_or_insert_id(&mut self, call_site: Function<'a>) -> FunctionId {
+    /// Add a (possibly) new Function, returning its ID. The code ID is the
+    /// pointer address of the function; it is presumed that a given code ID
+    /// will _usually_, but not always, point at the same function.
+    fn get_or_insert_id(&mut self, code_id: usize, function: Function<'a>) -> FunctionId {
         let max_id = &mut self.max_id;
-        if let Some(result) = self.function_to_id.get(&call_site) {
-            *result
-        } else {
+        let mut make_new_function = || {
             let new_id = *max_id;
             *max_id += 1;
-            let new_call_site = Function::new(
-                call_site.file_name.to_string(),
-                call_site.function_name.to_string(),
+            let new_function = Function::new(
+                function.file_name.to_string(),
+                function.function_name.to_string(),
             );
-            self.function_to_id.insert(new_call_site, new_id);
+            (new_function, new_id)
+        };
+        let entry = self.function_to_id.entry(code_id);
+        if let Entry::Occupied(mut result) = entry {
+            // Existing code object pointer. Probably the first function, but
+            // check just in case:
+            for (existing_function, f_id) in result.get() {
+                if function == *existing_function {
+                    return *f_id;
+                }
+            }
+            // At this point we assume the code ID was reused for a new code
+            // object. Insert at front since presumably the old code object is
+            // gone.
+            let (new_function, new_id) = make_new_function();
+            result.get_mut().insert(0, (new_function, new_id));
+            new_id
+        } else {
+            // New code object we've never seen before.
+            let (new_function, new_id) = make_new_function();
+            self.function_to_id
+                .insert(code_id, smallvec![(new_function, new_id)]);
             new_id
         }
     }
@@ -142,8 +165,10 @@ impl<'a> FunctionTracker {
     /// Get map from IDs to Functions.
     fn get_reverse_map(&self) -> HashMap<FunctionId, Function> {
         let mut result = HashMap::default();
-        for (call_site, csid) in &(self.function_to_id) {
-            result.insert(*csid, call_site.clone());
+        for (_, vec) in &(self.function_to_id) {
+            for (function, function_id) in vec {
+                result.insert(*function_id, function.clone());
+            }
         }
         result
     }
@@ -283,9 +308,14 @@ lazy_static! {
 }
 
 /// Add to per-thread function stack:
-pub fn start_call(call_site: Function<'static>, parent_line_number: u16, line_number: u16) {
+pub fn start_call(
+    code_id: usize,
+    function: Function<'static>,
+    parent_line_number: u16,
+    line_number: u16,
+) {
     let mut allocations = ALLOCATIONS.lock().unwrap();
-    let function_id = allocations.call_sites.get_or_insert_id(call_site);
+    let function_id = allocations.call_sites.get_or_insert_id(code_id, function);
     THREAD_CALLSTACK.with(|cs| {
         cs.borrow_mut().start_call(
             parent_line_number,
@@ -474,11 +504,11 @@ mod tests {
         let function2 = Function::new("b", "af");
         let function3 = Function::new("a", "bf");
         let mut functions = FunctionTracker::new();
-        let id1 = functions.get_or_insert_id(function1.clone());
-        let id1b = functions.get_or_insert_id(function1.clone());
-        let id2 = functions.get_or_insert_id(function2.clone());
-        let id3 = functions.get_or_insert_id(function3.clone());
-        let id3b = functions.get_or_insert_id(function3.clone());
+        let id1 = functions.get_or_insert_id(1, function1.clone());
+        let id1b = functions.get_or_insert_id(1, function1.clone());
+        let id2 = functions.get_or_insert_id(2, function2.clone());
+        let id3 = functions.get_or_insert_id(3, function3.clone());
+        let id3b = functions.get_or_insert_id(3, function3.clone());
         assert_eq!(id1, id1b);
         assert_ne!(id1, id2);
         assert_ne!(id1, id3);
@@ -497,27 +527,27 @@ mod tests {
         let id1 = CallSiteId::new(
             tracker
                 .call_sites
-                .get_or_insert_id(Function::new("a", "af")),
+                .get_or_insert_id(1, Function::new("a", "af")),
             1,
         );
         // Same function, different line number—should be different item:
         let id1_different = CallSiteId::new(
             tracker
                 .call_sites
-                .get_or_insert_id(Function::new("a", "af")),
+                .get_or_insert_id(1, Function::new("a", "af")),
             7,
         );
         let id2 = CallSiteId::new(
             tracker
                 .call_sites
-                .get_or_insert_id(Function::new("b", "bf")),
+                .get_or_insert_id(2, Function::new("b", "bf")),
             2,
         );
 
         let id3 = CallSiteId::new(
             tracker
                 .call_sites
-                .get_or_insert_id(Function::new("c", "cf")),
+                .get_or_insert_id(3, Function::new("c", "cf")),
             3,
         );
         let mut cs1 = Callstack::new();
