@@ -64,7 +64,6 @@ extern void pymemprofile_start_call(size_t code_id, uint16_t parent_line_number,
                                     const char *filename, const char *funcname,
                                     uint16_t line_number);
 extern void pymemprofile_finish_call();
-extern void pymemprofile_new_line_number(uint16_t line_number);
 extern void pymemprofile_reset();
 extern void pymemprofile_dump_peak_to_flamegraph(const char *path);
 extern void pymemprofile_add_allocation(size_t address, size_t length,
@@ -92,15 +91,6 @@ __attribute__((visibility("default"))) void fil_finish_call() {
   if (!will_i_be_reentrant) {
     will_i_be_reentrant = 1;
     pymemprofile_finish_call();
-    will_i_be_reentrant = 0;
-  }
-}
-
-__attribute__((visibility("default"))) void
-fil_new_line_number(uint16_t line_number) {
-  if (!will_i_be_reentrant) {
-    will_i_be_reentrant = 1;
-    pymemprofile_new_line_number(line_number);
     will_i_be_reentrant = 0;
   }
 }

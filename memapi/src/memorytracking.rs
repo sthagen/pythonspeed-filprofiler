@@ -13,6 +13,7 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
+use thread_id;
 
 type FunctionId = u32;
 
@@ -188,6 +189,7 @@ struct AllocationTracker {
     current_allocated_bytes: usize,
     peak_allocated_bytes: usize,
     call_sites: FunctionTracker,
+    thread_callstacks: HashMap<usize, Callstack>,
 }
 
 impl<'a> AllocationTracker {
@@ -198,7 +200,36 @@ impl<'a> AllocationTracker {
             current_allocated_bytes: 0,
             peak_allocated_bytes: 0,
             call_sites: FunctionTracker::new(),
+            thread_callstacks: HashMap::default(),
         }
+    }
+
+    /// Get the current callstack.
+    fn get_thread_callstack(&mut self) -> &mut Callstack {
+        let tid = thread_id::get();
+        self.thread_callstacks
+            .entry(tid)
+            .or_insert_with(|| Callstack::new())
+    }
+
+    /// Start a new call on the thread's callstack.
+    fn start_call(
+        &mut self,
+        code_id: usize,
+        function: Function<'static>,
+        parent_line_number: u16,
+        line_number: u16,
+    ) {
+        let function_id = self.call_sites.get_or_insert_id(code_id, function);
+        self.get_thread_callstack().start_call(
+            parent_line_number,
+            CallSiteId::new(function_id, line_number),
+        );
+    }
+
+    /// Finish a call.
+    fn finish_call(&mut self) {
+        self.get_thread_callstack().finish_call();
     }
 
     /// Add a new allocation based off the current callstack.
@@ -315,37 +346,24 @@ pub fn start_call(
     line_number: u16,
 ) {
     let mut allocations = ALLOCATIONS.lock().unwrap();
-    let function_id = allocations.call_sites.get_or_insert_id(code_id, function);
-    THREAD_CALLSTACK.with(|cs| {
-        cs.borrow_mut().start_call(
-            parent_line_number,
-            CallSiteId::new(function_id, line_number),
-        );
-    });
+    allocations.start_call(code_id, function, parent_line_number, line_number);
 }
 
 /// Finish off (and move to reporting structure) current function in function
 /// stack.
 pub fn finish_call() {
-    THREAD_CALLSTACK.with(|cs| {
-        cs.borrow_mut().finish_call();
-    });
-}
-
-/// Change line number on current function in per-thread function stack:
-pub fn new_line_number(line_number: u16) {
-    THREAD_CALLSTACK.with(|cs| {
-        cs.borrow_mut().new_line_number(line_number);
-    });
+    let mut allocations = ALLOCATIONS.lock().unwrap();
+    allocations.finish_call();
 }
 
 /// Add a new allocation based off the current callstack.
 pub fn add_allocation(address: usize, size: libc::size_t, line_number: u16) {
-    let mut callstack: Callstack = THREAD_CALLSTACK.with(|cs| (*cs.borrow()).clone());
+    let mut allocations = ALLOCATIONS.lock().unwrap();
+    let mut callstack: Callstack = allocations.get_thread_callstack().clone();
     if line_number != 0 && !callstack.calls.is_empty() {
         callstack.new_line_number(line_number);
     }
-    let mut allocations = ALLOCATIONS.lock().unwrap();
+
     allocations.add_allocation(address, size, callstack);
 }
 
