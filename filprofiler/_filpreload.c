@@ -10,6 +10,7 @@
 #include <sys/mman.h>
 
 #if PY_VERSION_HEX < 0x03080000
+extern PyAPI_FUNC(int) _Py_UnixMain(int argc, char **argv);
 #define Py_BytesMain _Py_UnixMain
 #endif
 
@@ -28,7 +29,11 @@ static _Thread_local int will_i_be_reentrant = 0;
 // Current thread's Python state:
 static _Thread_local PyFrameObject *current_frame = NULL;
 
-int main(int argc, char **argv) {
+static void __attribute__((constructor)) constructor() {
+  if (initialized) {
+    return;
+  }
+
   if (sizeof((void *)0) != sizeof((size_t)0)) {
     fprintf(stderr, "BUG: expected size of size_t and void* to be the same.\n");
     exit(1);
@@ -48,8 +53,9 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Couldn't load free(): %s\n", dlerror());
     exit(1);
   }
+
   initialized = 1;
-  return Py_BytesMain(argc, argv);
+  unsetenv("LD_PRELOAD");
 }
 
 extern void *__libc_malloc(size_t size);
@@ -191,4 +197,11 @@ fil_tracer(PyObject *obj, PyFrameObject *frame, int what, PyObject *arg) {
   return 0;
 }
 
-void register_fil_tracer() { PyEval_SetProfile(fil_tracer, Py_None); }
+__attribute__((visibility("default"))) void register_fil_tracer() {
+  PyEval_SetProfile(fil_tracer, Py_None);
+}
+
+__attribute__((visibility("default"))) void fil_shutting_down() {
+  // We're shutting down, so things like PyCode_Addr2Line won't work:
+  will_i_be_reentrant = 1;
+}

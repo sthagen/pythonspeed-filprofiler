@@ -18,9 +18,11 @@ from ._utils import library_path
 from ._tracer import trace, dump_svg
 from . import __version__, __file__
 
-# TODO if we go with exe mode, don't need two-stage execution
+
 def stage_1():
     """Setup environment variables, re-execute this script."""
+    # Load the library:
+    environ["LD_PRELOAD"] = library_path("_filpreload")
     # Tracebacks when Rust crashes:
     environ["RUST_BACKTRACE"] = "1"
     # Route all allocations from Python through malloc() directly:
@@ -34,7 +36,9 @@ def stage_1():
     environ["VECLIB_MAXIMUM_THREADS"] = "1"
     environ["NUMEXPR_NUM_THREADS"] = "1"
 
-    execv(which("fil-python"), ["fil-python", "-m", "filprofiler._script"] + sys.argv[1:])
+    execv(
+        sys.executable, [sys.executable, "-m", "filprofiler._script"] + sys.argv[1:],
+    )
 
 
 def stage_2():

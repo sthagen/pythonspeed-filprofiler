@@ -5,21 +5,20 @@ mkdir /tmp/wheel
 export HOME=/tmp/home
 cd /src
 mkdir -p dist
-PATH=/opt/python/cp38-cp38/bin/:$PATH make clean
-make filprofiler/libpymemprofile_api.so
+make target/release/libpymemprofile_api.a
 
-PATH=/opt/python/cp36-cp36m/bin/:$PATH make filprofiler/_filpreload.so
-/opt/python/cp36-cp36m/bin/pip wheel . -w /tmp/wheel
-rm -f filprofiler/_filpreload.so
 
-PATH=/opt/python/cp37-cp37m/bin/:$PATH make filprofiler/_filpreload.so
-/opt/python/cp37-cp37m/bin/pip wheel . -w /tmp/wheel
-rm -f filprofiler/_filpreload.so
+rm -f filprofiler/_filpreload.o
+rm -f filprofiler/_filpreload*.so
+rm -f filprofiler/_filpreload*.dylib
+rm -rf build
 
-PATH=/opt/python/cp38-cp38m/bin/:$PATH make filprofiler/_filpreload.so
-/opt/python/cp38-cp38/bin/pip wheel . -w /tmp/wheel
-rm -f filprofiler/_filpreload.so
+/opt/python/cp36-cp36m/bin/python3 setup.py bdist_wheel -d /tmp/wheel
 
-auditwheel repair -w dist/ /tmp/wheel/filprofiler*36*whl
-auditwheel repair -w dist/ /tmp/wheel/filprofiler*37*whl
-auditwheel repair -w dist/ /tmp/wheel/filprofiler*38*whl
+/opt/python/cp37-cp37m/bin/python3 setup.py bdist_wheel -d /tmp/wheel
+
+/opt/python/cp38-cp38/bin/python3 setup.py bdist_wheel -d /tmp/wheel
+
+auditwheel addtag -w dist/ /tmp/wheel/filprofiler*36*whl
+auditwheel addtag -w dist/ /tmp/wheel/filprofiler*37*whl
+auditwheel addtag -w dist/ /tmp/wheel/filprofiler*38*whl

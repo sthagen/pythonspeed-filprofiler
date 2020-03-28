@@ -1,11 +1,19 @@
+from os.path import join
 from setuptools import setup, Extension
 
 setup(
     name="filprofiler",
-    version="0.1",
     packages=["filprofiler"],
     entry_points={"console_scripts": ["fil-profile=filprofiler._script:stage_1"],},
-    package_data={"filprofiler": ["fil-python",]},
+    ext_modules=[
+        Extension(
+            name="filprofiler._filpreload",
+            sources=[join("filprofiler", "_filpreload.c")],
+            extra_objects=[join("target", "release", "libpymemprofile_api.a")],
+            extra_compile_args=["-fno-omit-frame-pointer"],
+            extra_link_args=["-export-dynamic"],
+        )
+    ],
     use_scm_version=True,
     setup_requires=["setuptools_scm"],
     extras_require={

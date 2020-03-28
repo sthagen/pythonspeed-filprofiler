@@ -3,6 +3,7 @@
 from subprocess import check_call, check_output
 from tempfile import mkdtemp, NamedTemporaryFile
 from pathlib import Path
+from glob import glob
 
 from pampy import match, _ as ANY
 import pytest
@@ -11,7 +12,7 @@ import pytest
 def get_allocations(output_directory: Path):
     """Parses peak-memory.prof, returns mapping from callstack to size in KiB."""
     result = {}
-    with open(output_directory / "peak-memory.prof") as f:
+    with open(glob(str(output_directory / "*" / "peak-memory.prof"))[0]) as f:
         for line in f:
             *calls, size_kb = line.split(" ")
             calls = " ".join(calls)
@@ -28,7 +29,7 @@ def get_allocations(output_directory: Path):
                 file_name, line = part1.split(":")
                 line = int(line)
                 path.append((file_name, func_name, line))
-            if size_kb > 10:
+            if size_kb > 900:
                 result[tuple(path)] = size_kb
     return result
 
