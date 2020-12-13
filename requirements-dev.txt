@@ -1,0 +1,16 @@
+pytest
+pampy
+numpy
+#scikit-image
+cython
+black
+towncrier==19.9.0rc1
+wheel
+auditwheel
+twine
+ipython
+ipykernel
+# nbconvert 6 can't be used temporarily due to https://github.com/jupyter/nbconvert/issues/1440
+nbconvert<6
+numexpr
+blosc

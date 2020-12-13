@@ -3,55 +3,21 @@
 from subprocess import check_call, check_output, CalledProcessError, run, PIPE
 from tempfile import mkdtemp, NamedTemporaryFile
 from pathlib import Path
-from glob import glob
 import os
 import time
 import sys
+from typing import Union
+import re
+import shutil
 
+import numpy.core.numeric
 from pampy import match, _ as ANY
 import pytest
 
-
-def get_allocations(
-    output_directory: Path,
-    expected_files=[
-        "peak-memory.svg",
-        "peak-memory-reversed.svg",
-        "index.html",
-        "peak-memory.prof",
-    ],
-    prof_file="peak-memory.prof",
-):
-    """Parses peak-memory.prof, returns mapping from callstack to size in KiB."""
-    assert sorted(os.listdir(glob(str(output_directory / "*"))[0])) == sorted(
-        expected_files
-    )
-    result = {}
-    with open(glob(str(output_directory / "*" / prof_file))[0]) as f:
-        for line in f:
-            *calls, size_kb = line.split(" ")
-            calls = " ".join(calls)
-            size_kb = int(int(size_kb) / 1024)
-            path = []
-            if calls == "[No Python stack]":
-                result[calls] = size_kb
-                continue
-            for call in calls.split(";"):
-                if call.startswith("TB@@"):
-                    continue
-                part1, func_name = call.rsplit(" ", 1)
-                assert func_name[0] == "("
-                assert func_name[-1] == ")"
-                func_name = func_name[1:-1]
-                file_name, line = part1.split(":")
-                line = int(line)
-                path.append((file_name, func_name, line))
-            if size_kb > 900:
-                result[tuple(path)] = size_kb
-    return result
+from filprofiler._testing import get_allocations, big, as_mb
 
 
-def profile(*arguments: str, expect_exit_code=0, **kwargs) -> Path:
+def profile(*arguments: Union[str, Path], expect_exit_code=0, **kwargs) -> Path:
     """Run fil-profile on given script, return path to output directory."""
     output = Path(mkdtemp())
     try:
@@ -66,14 +32,6 @@ def profile(*arguments: str, expect_exit_code=0, **kwargs) -> Path:
     return output
 
 
-def as_mb(*args):
-    return args[-1] / 1024
-
-
-def big(length):
-    return length > 10000
-
-
 def test_threaded_allocation_tracking():
     """
     fil-profile tracks allocations from all threads.
@@ -86,7 +44,6 @@ def test_threaded_allocation_tracking():
     allocations = get_allocations(output_dir)
 
     import threading
-    import numpy.core.numeric
 
     threading = (threading.__file__, "run", ANY)
     ones = (numpy.core.numeric.__file__, "ones", ANY)
@@ -120,7 +77,6 @@ def test_thread_allocates_after_main_thread_is_done():
     allocations = get_allocations(output_dir)
 
     import threading
-    import numpy.core.numeric
 
     threading = (threading.__file__, "run", ANY)
     ones = (numpy.core.numeric.__file__, "ones", ANY)
@@ -130,21 +86,86 @@ def test_thread_allocates_after_main_thread_is_done():
     assert match(allocations, {thread1_path1: big}, as_mb) == pytest.approx(70, 0.1)
 
 
+def test_c_thread():
+    """
+    Allocations in C-only threads are considered allocations by the Python code
+    that launched the thread.
+    """
+    script = Path("python-benchmarks") / "c-thread.py"
+    output_dir = profile(script)
+    allocations = get_allocations(output_dir)
+
+    script = str(script)
+    alloc = ((script, "<module>", 13), (script, "main", 9))
+
+    assert match(allocations, {alloc: big}, as_mb) == pytest.approx(17, 0.1)
+
+
 def test_malloc_in_c_extension():
     """
-    Direct malloc() in C extension gets captured.
-
-    (NumPy uses Python memory APIs, so is not sufficient to test this.)
+    Various malloc() and friends variants in C extension gets captured.
     """
     script = Path("python-benchmarks") / "malloc.py"
     output_dir = profile(script, "--size", "70")
     allocations = get_allocations(output_dir)
 
     script = str(script)
-    path = ((script, "<module>", 21), (script, "main", 17))
 
     # The realloc() in the scripts adds 10 to the 70:
+    path = ((script, "<module>", 32), (script, "main", 28))
     assert match(allocations, {path: big}, as_mb) == pytest.approx(70 + 10, 0.1)
+
+    # The C++ new allocation:
+    path = ((script, "<module>", 32), (script, "main", 23))
+    assert match(allocations, {path: big}, as_mb) == pytest.approx(40, 0.1)
+
+    # C++ aligned_alloc(); not available on Conda, where it's just a macro
+    # redirecting to posix_memalign.
+    if not os.environ.get("CONDA_PREFIX"):
+        path = ((script, "<module>", 32), (script, "main", 24))
+        assert match(allocations, {path: big}, as_mb) == pytest.approx(90, 0.1)
+
+    # Py*_*Malloc APIs:
+    path = ((script, "<module>", 32), (script, "main", 25))
+    assert match(allocations, {path: big}, as_mb) == pytest.approx(30, 0.1)
+
+    # posix_memalign():
+    path = ((script, "<module>", 32), (script, "main", 26))
+    assert match(allocations, {path: big}, as_mb) == pytest.approx(15, 0.1)
+
+
+def test_anonymous_mmap():
+    """
+    Non-file-backed mmap() gets detected and tracked.
+
+    (NumPy uses Python memory APIs, so is not sufficient to test this.)
+    """
+    script = Path("python-benchmarks") / "mmaper.py"
+    output_dir = profile(script)
+    allocations = get_allocations(output_dir)
+
+    script = str(script)
+    path = ((script, "<module>", 6),)
+
+    assert match(allocations, {path: big}, as_mb) == pytest.approx(60, 0.1)
+
+
+def test_python_objects():
+    """
+    Python objects gets detected and tracked.
+
+    (NumPy uses Python memory APIs, so is not sufficient to test this.)
+    """
+    script = Path("python-benchmarks") / "pyobject.py"
+    output_dir = profile(script)
+    allocations = get_allocations(output_dir)
+
+    script = str(script)
+    path = ((script, "<module>", 1),)
+    path2 = ((script, "<module>", 8), (script, "<genexpr>", 8))
+
+    assert match(allocations, {path: big}, as_mb) == pytest.approx(34, 1)
+    assert match(allocations, {path2: big}, as_mb) == pytest.approx(46, 1)
 
 
 def test_minus_m():
@@ -157,7 +178,39 @@ def test_minus_m():
     allocations = get_allocations(output_dir)
     stripped_allocations = {k[3:]: v for (k, v) in allocations.items()}
     script = str(script)
-    path = ((script, "<module>", 21), (script, "main", 17))
+    path = ((script, "<module>", 32), (script, "main", 28))
+
+    assert match(stripped_allocations, {path: big}, as_mb) == pytest.approx(
+        50 + 10, 0.1
+    )
+
+
+def test_minus_m_minus_m():
+    """
+    `python -m filprofiler -m package` runs the package.
+    """
+    dir = Path("python-benchmarks")
+    script = (dir / "malloc.py").absolute()
+    output_dir = Path(mkdtemp())
+    check_call(
+        [
+            sys.executable,
+            "-m",
+            "filprofiler",
+            "-o",
+            str(output_dir),
+            "run",
+            "-m",
+            "malloc",
+            "--size",
+            "50",
+        ],
+        cwd=dir,
+    )
+    allocations = get_allocations(output_dir)
+    stripped_allocations = {k[3:]: v for (k, v) in allocations.items()}
+    script = str(script)
+    path = ((script, "<module>", 32), (script, "main", 28))
 
     assert match(stripped_allocations, {path: big}, as_mb) == pytest.approx(
         50 + 10, 0.1
@@ -179,7 +232,7 @@ print(subprocess.check_output(["env"]))
         result = check_output(
             ["fil-profile", "-o", mkdtemp(), "run", str(script_file.name)]
         )
-        assert b"LD_PRELOAD" not in result
+        assert b"\nLD_PRELOAD=" not in result.splitlines()
         # Not actually done at the moment, though perhaps it should be:
         # assert b"DYLD_INSERT_LIBRARIES" not in result
 
@@ -197,9 +250,6 @@ def test_out_of_memory():
         ["out-of-memory.svg", "out-of-memory-reversed.svg", "out-of-memory.prof",],
         "out-of-memory.prof",
     )
-
-    import threading
-    import numpy.core.numeric
 
     ones = (numpy.core.numeric.__file__, "ones", ANY)
     script = str(script)
@@ -251,6 +301,90 @@ def test_no_args():
     """
     no_args = run(["fil-profile"], stdout=PIPE, stderr=PIPE)
     with_help = run(["fil-profile", "--help"], stdout=PIPE, stderr=PIPE)
+    no_args_minus_m = run(
+        [sys.executable, "-m", "filprofiler"], stdout=PIPE, stderr=PIPE
+    )
     assert no_args.returncode == with_help.returncode
     assert no_args.stdout == with_help.stdout
     assert no_args.stderr == with_help.stderr
+    assert no_args_minus_m.stdout == with_help.stdout
+    assert no_args_minus_m.stderr == with_help.stderr
+
+
+def test_fortran():
+    """
+    Fil can capture Fortran allocations.
+    """
+    script = Path("python-benchmarks") / "fortranallocate.py"
+    output_dir = profile(script)
+    allocations = get_allocations(output_dir)
+
+    script = str(script)
+    path = ((script, "<module>", 3),)
+
+    assert match(allocations, {path: big}, as_mb) == pytest.approx(40, 0.1)
+
+
+def test_free():
+    """free() frees allocations as far as Fil is concerned."""
+    script = Path("python-benchmarks") / "ldpreload.py"
+    profile(script)
+
+
+def test_interpreter_with_fil():
+    """Run tests that require `fil-profile python`."""
+    check_call(
+        [
+            "fil-profile",
+            "python",
+            "-m",
+            "pytest",
+            str(Path("python-benchmarks") / "fil-interpreter.py"),
+        ]
+    )
+
+
+def test_jupyter(tmpdir):
+    """Jupyter magic can run Fil."""
+    tests_dir = Path(__file__).resolve().parent.parent / "python-benchmarks"
+    shutil.copyfile(tests_dir / "jupyter.ipynb", tmpdir / "jupyter.ipynb")
+    check_call(
+        ["jupyter", "nbconvert", "--execute", "jupyter.ipynb", "--to", "html",],
+        cwd=tmpdir,
+    )
+    output_dir = tmpdir / "fil-result"
+
+    # IFrame with SVG was included in output:
+    with open(tmpdir / "jupyter.html") as f:
+        html = f.read()
+    assert "<iframe" in html
+    [svg_path] = re.findall(r'src="([^"]*\.svg)"', html)
+    assert svg_path.endswith("peak-memory.svg")
+    assert Path(tmpdir / svg_path).exists()
+
+    # Allocations were tracked:
+    allocations = get_allocations(output_dir)
+    print(allocations)
+    path = (
+        (re.compile("<ipython-input-3-.*"), "__magic_run_with_fil", 2),
+        (re.compile("<ipython-input-2-.*"), "alloc", 4),
+        (numpy.core.numeric.__file__, "ones", ANY),
+    )
+    assert match(allocations, {path: big}, as_mb) == pytest.approx(48, 0.1)
+
+
+def test_no_threadpools_filprofile_run():
+    """`fil-profile run` disables thread pools it knows about."""
+    check_call(
+        ["fil-profile", "run", str(Path("python-benchmarks") / "threadpools.py"),]
+    )
+
+
+def test_malloc_on_thread_exit():
+    """malloc() in thread shutdown handler doesn't blow things up.
+
+    Reproducer for https://github.com/pythonspeed/filprofiler/issues/99
+    """
+    check_call(
+        ["fil-profile", "run", str(Path("python-benchmarks") / "thread_exit.py"),]
+    )
