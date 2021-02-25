@@ -8,24 +8,42 @@ import sys
 import threading
 import webbrowser
 from contextlib import contextmanager
+from pathlib import Path
+from typing import Union
+import traceback
 
 from ._utils import timestamp_now, library_path
 from ._report import render_report
 
-if os.environ.get("FIL_BENCHMARK"):
-    # We're using Valgrind + executable:
-    preload = PyDLL(None)
-else:
-    # We're using preloaded library:
-    preload = PyDLL(library_path("_filpreload"))
-preload.fil_initialize_from_python()
+try:
+    if sys.platform == "linux":
+        # Linux only, and somehow loading library breaks stuff.
+        preload = PyDLL(None)
+    else:
+        # macOS.
+        preload = PyDLL(library_path("_filpreload"))
+    preload.fil_initialize_from_python()
+except Exception as e:
+    raise SystemExit(
+        f"""\
+Failed to preload the Fil shared library: {e}.
+
+This can happen on Linux for unknown reasons on versions of glibc older than 2.30. Upgrading to a version of Linux from 2020 or later might solve this.
+
+If you're on macOS or a sufficiently new Linux, you've found a bug! You can file an issue or just ask for help at:
+https://github.com/pythonspeed/filprofiler/issues/new/choose
+
+Full trackback:
+
+{traceback.format_exc()}
+"""
+    )
 
 
-def start_tracing(output_path: str):
+def start_tracing(output_path: Union[str, Path]):
     """Start tracing allocations."""
-    path = os.path.join(output_path, timestamp_now()).encode("utf-8")
-    preload.fil_reset(path)
-    preload.fil_start_tracing()
+    preload.fil_reset(str(output_path).encode("utf-8"))
+    preload.fil_start_tracking()
     threading.setprofile(_start_thread_trace)
     preload.register_fil_tracer()
 
@@ -50,7 +68,7 @@ def stop_tracing(output_path: str) -> str:
     """
     sys.setprofile(None)
     threading.setprofile(None)
-    preload.fil_shutting_down()
+    preload.fil_stop_tracking()
     result = create_report(output_path)
     # Clear allocations; we don't need them anymore, and they're just wasting
     # memory:
@@ -58,10 +76,9 @@ def stop_tracing(output_path: str) -> str:
     return result
 
 
-def create_report(output_path: str) -> str:
+def create_report(output_path: Union[str, Path]) -> str:
+    preload.fil_dump_peak_to_flamegraph(str(output_path).encode("utf-8"))
     now = datetime.now()
-    output_path = os.path.join(output_path, now.isoformat(timespec="milliseconds"))
-    preload.fil_dump_peak_to_flamegraph(output_path.encode("utf-8"))
     return render_report(output_path, now)
 
 
@@ -78,7 +95,7 @@ def trace_until_exit(code, globals_, output_path: str):
                 file=sys.stderr,
             )
             return
-        index_path = stop_tracing(output_path)
+        index_path = stop_tracing(os.path.join(output_path, timestamp_now()))
         print("=fil-profile= Wrote HTML report to " + index_path, file=sys.stderr)
         try:
             webbrowser.open("file://" + os.path.abspath(index_path))
@@ -92,7 +109,7 @@ def trace_until_exit(code, globals_, output_path: str):
     # Use atexit rather than try/finally so threads that live beyond main
     # thread also get profiled:
     atexit.register(shutdown)
-    start_tracing(output_path)
+    start_tracing(os.path.join(output_path, timestamp_now()))
     with disable_thread_pools():
         exec(code, globals_, None)
 

@@ -13,19 +13,25 @@ import shutil
 import numpy.core.numeric
 from pampy import match, _ as ANY
 import pytest
+import psutil
 
 from filprofiler._testing import get_allocations, big, as_mb
-
+from filprofiler._utils import glibc_version
 
 TEST_SCRIPTS = Path("tests") / "test-scripts"
 
 
-def profile(*arguments: Union[str, Path], expect_exit_code=0, **kwargs) -> Path:
+def profile(
+    *arguments: Union[str, Path], expect_exit_code=0, argv_prefix=(), **kwargs
+) -> Path:
     """Run fil-profile on given script, return path to output directory."""
     output = Path(mkdtemp())
     try:
         check_call(
-            ["fil-profile", "-o", str(output), "run"] + list(arguments), **kwargs
+            list(argv_prefix)
+            + ["fil-profile", "-o", str(output), "run"]
+            + list(arguments),
+            **kwargs,
         )
         exit_code = 0
     except CalledProcessError as e:
@@ -246,7 +252,7 @@ def test_out_of_memory():
     written out.
     """
     script = TEST_SCRIPTS / "oom.py"
-    output_dir = profile(script, expect_exit_code=5)
+    output_dir = profile(script, expect_exit_code=53)
     time.sleep(10)  # wait for child process to finish
     allocations = get_allocations(
         output_dir,
@@ -257,7 +263,7 @@ def test_out_of_memory():
     ones = (numpy.core.numeric.__file__, "ones", ANY)
     script = str(script)
     expected_small_alloc = ((script, "<module>", 9), ones)
-    toobig_alloc = ((script, "<module>", 14), ones)
+    toobig_alloc = ((script, "<module>", 12), ones)
 
     assert match(allocations, {expected_small_alloc: big}, as_mb) == pytest.approx(
         100, 0.1
@@ -265,6 +271,82 @@ def test_out_of_memory():
     assert match(allocations, {toobig_alloc: big}, as_mb) == pytest.approx(
         1024 * 1024 * 1024, 0.1
     )
+
+
+def test_out_of_memory_slow_leak():
+    """
+    If an allocation is run that runs out of memory slowly, current allocations are
+    written out.
+    """
+    script = TEST_SCRIPTS / "oom-slow.py"
+    output_dir = profile(script, expect_exit_code=53)
+    time.sleep(10)  # wait for child process to finish
+    allocations = get_allocations(
+        output_dir,
+        ["out-of-memory.svg", "out-of-memory-reversed.svg", "out-of-memory.prof",],
+        "out-of-memory.prof",
+    )
+
+    expected_alloc = ((str(script), "<module>", 3),)
+
+    # Should've allocated at least a little before running out, unless testing
+    # environment is _really_ restricted, in which case other tests would've
+    # failed.
+    assert match(allocations, {expected_alloc: big}, as_mb) > 100
+
+
+def get_systemd_run_args(available_memory):
+    """
+    Figure out if we're on system with cgroups v2, or not, and return
+    appropriate systemd-run args.
+
+    If we don't have v2, we'll need to be root, unfortunately.
+    """
+    args = [
+        "systemd-run",
+        "--uid",
+        str(os.geteuid()),
+        "--gid",
+        str(os.getegid()),
+        "-p",
+        f"MemoryLimit={available_memory // 2}B",
+    ]
+    try:
+        check_call(args + ["--user", "printf", "hello"])
+        args += ["--user", "--scope"]
+    except CalledProcessError:
+        # cgroups v1 doesn't do --user :(
+        args = ["sudo", "--preserve-env=PATH"] + args + ["-t", "--same-dir"]
+    return args
+
+
+@pytest.mark.skipif(
+    shutil.which("systemd-run") is None or glibc_version() < (2, 30),
+    reason="systemd-run not found, or old systemd probably",
+)
+def test_out_of_memory_slow_leak_cgroups():
+    """
+    If an allocation is run that runs out of memory slowly, hitting a cgroup
+    limit that's lower than system memory, current allocations are written out.
+    """
+    available_memory = psutil.virtual_memory().available
+    script = TEST_SCRIPTS / "oom-slow.py"
+    output_dir = profile(
+        script, expect_exit_code=53, argv_prefix=get_systemd_run_args(available_memory),
+    )
+    time.sleep(10)  # wait for child process to finish
+    allocations = get_allocations(
+        output_dir,
+        ["out-of-memory.svg", "out-of-memory-reversed.svg", "out-of-memory.prof",],
+        "out-of-memory.prof",
+    )
+
+    expected_alloc = ((str(script), "<module>", 3),)
+
+    # Should've allocated at least a little before running out, unless testing
+    # environment is _really_ restricted, in which case other tests would've
+    # failed.
+    assert match(allocations, {expected_alloc: big}, as_mb) > 100
 
 
 def test_external_behavior():
@@ -366,11 +448,21 @@ def test_jupyter(tmpdir):
     allocations = get_allocations(output_dir)
     print(allocations)
     path = (
-        (re.compile("<ipython-input-3-.*"), "__magic_run_with_fil", 2),
+        (re.compile("<ipython-input-3-.*"), "__magic_run_with_fil", 3),
         (re.compile("<ipython-input-2-.*"), "alloc", 4),
         (numpy.core.numeric.__file__, "ones", ANY),
     )
     assert match(allocations, {path: big}, as_mb) == pytest.approx(48, 0.1)
+    path2 = (
+        (re.compile("<ipython-input-3-.*"), "__magic_run_with_fil", 2),
+        (numpy.core.numeric.__file__, "ones", ANY),
+    )
+    assert match(allocations, {path2: big}, as_mb) == pytest.approx(20, 0.1)
+    # It's possible to run nbconvert again.
+    check_call(
+        ["jupyter", "nbconvert", "--execute", "jupyter.ipynb", "--to", "html",],
+        cwd=tmpdir,
+    )
 
 
 def test_no_threadpools_filprofile_run():

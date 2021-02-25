@@ -7,15 +7,14 @@ Command-line tools. Because of LD_PRELOAD, it's actually a two stage setup:
 
 import json
 import sys
-from os import environ, execv, getpid, makedirs
+from os import environ, execve, getpid, makedirs
 from os.path import abspath, dirname, join, exists
 from argparse import ArgumentParser, RawDescriptionHelpFormatter, REMAINDER
+from typing import List
 import runpy
 import signal
 from shutil import which
-from subprocess import check_output, check_call
-
-from ._utils import library_path
+from ._utils import library_path, glibc_version
 from ._cachegrind import benchmark
 from . import __version__, __file__
 
@@ -65,62 +64,6 @@ visit https://pythonspeed.com/products/filmemoryprofiler/
 """
 
 
-def stage_1():
-    """Setup environment variables, re-execute this script."""
-    if len(sys.argv) == 1:
-        PARSER.print_help()
-        sys.exit(0)
-
-    # Tracebacks when Rust crashes:
-    environ["RUST_BACKTRACE"] = "1"
-    # Route all allocations from Python through malloc() directly:
-    environ["PYTHONMALLOC"] = "malloc"
-    # Tell jemalloc code (if used) to clean up faster:
-    if environ.get("_RJEM_MALLOC_CONF") is None:
-        environ[
-            "_RJEM_MALLOC_CONF"
-        ] = "dirty_decay_ms:100,muzzy_decay_ms:1000,abort_conf:true"
-
-    if sys.argv[1] == "python":
-        environ["FIL_PYTHON"] = "1"
-        # Start the normal Python interpreter, with Fil available but inactive.
-        args = sys.argv[2:]
-    else:
-        args = ["-m", "filprofiler._script"] + sys.argv[1:]
-
-    if environ.get("FIL_BENCHMARK"):
-        destination = environ["FIL_BENCHMARK"]
-        # Set fixed hash, in order to get repeatable results:
-        environ["PYTHONHASHSEED"] = "12345"
-
-        # We run the script twice, once with just normal Python, once with Fil,
-        # and report the difference. That way we're measuring overhead, and not
-        # counting time that's just Python doing its normal thing.
-        # 1. Run with just Python:
-        if sys.argv[1] == "python":
-            pyargs = sys.argv[2:]
-        else:
-            arguments = PARSER.parse_args()
-            pyargs = arguments.rest
-        python_result = benchmark([sys.executable] + pyargs)
-        # 2. Run using Valgrind + executable (Valgrind doesn't work well with
-        # LD_PRELOAD).
-        fil_result = benchmark([which("_fil-python")] + args)
-        # 3. Store the difference.
-        result = {k: (fil_result[k] - python_result[k]) for k in fil_result}
-        with open(destination, "w+") as f:
-            json.dump(result, f, sort_keys=True, indent=4)
-            f.flush()
-            f.seek(0, 0)
-            print("Wrote performance to {}:".format(destination))
-            print(f.read())
-    else:
-        # Normal operation, via LD_PRELOAD or equivalent:
-        environ["LD_PRELOAD"] = library_path("_filpreload")
-        environ["DYLD_INSERT_LIBRARIES"] = library_path("_filpreload")
-        execv(sys.executable, [sys.executable] + args)
-
-
 PARSER = ArgumentParser(
     usage="fil-profile [-o output-path] run [-m module | /path/to/script.py ] [arg] ...",
     epilog=HELP,
@@ -145,6 +88,90 @@ parser_run = subparsers.add_parser(
 parser_run.set_defaults(command="run")
 parser_run.add_argument("rest", nargs=REMAINDER)
 del subparsers, parser_run
+
+# Can't figure out if this is a standard path _everywhere_, but it definitely
+# exists on Ubuntu 18.04 and 20.04, Debian Buster, CentOS 8, and Arch.
+LD_LINUX = "/lib64/ld-linux-x86-64.so.2"
+
+
+def stage_1_benchmark(args: List[str]):
+    """Run the script in benchmarking mode."""
+    destination = environ["FIL_BENCHMARK"]
+    # Set fixed hash, in order to get repeatable results:
+    environ["PYTHONHASHSEED"] = "12345"
+
+    # We run the script twice, once with just normal Python, once with Fil,
+    # and report the difference. That way we're measuring overhead, and not
+    # counting time that's just Python doing its normal thing.
+    # 1. Run with just Python:
+    if sys.argv[1] == "python":
+        pyargs = sys.argv[2:]
+    else:
+        arguments = PARSER.parse_args()
+        pyargs = arguments.rest
+    python_result = benchmark([sys.executable] + pyargs)
+    # 2. Run using Valgrind. Valgrind has its own LD_PRELOAD which has
+    # issues with our own, so we add our extra LD_PRELOAD by using
+    # command-line based non-execve()ing /lib/ld.so's preload support,
+    # without having Valgrind trace forks.
+    fil_result = benchmark(
+        [LD_LINUX, "--preload", library_path("_filpreload"), which("python")] + args
+    )
+    # 3. Store the difference.
+    result = {k: (fil_result[k] - python_result[k]) for k in fil_result}
+    with open(destination, "w+") as f:
+        json.dump(result, f, sort_keys=True, indent=4)
+        f.flush()
+        f.seek(0, 0)
+        print("Wrote performance to {}:".format(destination))
+        print(f.read())
+
+
+def stage_1():
+    """Setup environment variables, re-execute this script."""
+    if len(sys.argv) == 1:
+        PARSER.print_help()
+        sys.exit(0)
+
+    # Tracebacks when Rust crashes:
+    environ["RUST_BACKTRACE"] = "1"
+    # Route all allocations from Python through malloc() directly:
+    environ["PYTHONMALLOC"] = "malloc"
+    # Tell jemalloc code (if used) to clean up faster:
+    if environ.get("_RJEM_MALLOC_CONF") is None:
+        environ[
+            "_RJEM_MALLOC_CONF"
+        ] = "dirty_decay_ms:100,muzzy_decay_ms:1000,abort_conf:true"
+
+    if sys.argv[1] == "python":
+        # Tells IPython layer we're setup correctly:
+        environ["__FIL_PYTHON"] = "1"
+        # Start the normal Python interpreter, with Fil available but inactive.
+        args = sys.argv[2:]
+    else:
+        args = ["-m", "filprofiler._script"] + sys.argv[1:]
+
+    if environ.get("FIL_BENCHMARK"):
+        stage_1_benchmark(args)
+        return
+
+    # Normal operation, via LD_PRELOAD or equivalent:
+    to_preload = library_path("_filpreload")
+    executable = sys.executable
+
+    if sys.platform == "linux":
+        if glibc_version() >= (2, 30) and exists(LD_LINUX):
+            # Launch with ld.so, which is more robust than relying on
+            # environment variables.
+            executable = LD_LINUX
+            args = ["--preload", to_preload, sys.executable] + args
+        else:
+            # Fall back to LD_PRELOAD env variable on older versions of glibc.
+            environ["LD_PRELOAD"] = to_preload
+    else:
+        environ["DYLD_INSERT_LIBRARIES"] = to_preload
+
+    execve(executable, [executable] + args, env=environ)
 
 
 def stage_2():

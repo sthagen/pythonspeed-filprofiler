@@ -10,6 +10,8 @@ import os
 from ctypes import c_void_p
 import re
 from pathlib import Path
+from subprocess import check_output
+import multiprocessing
 
 import pytest
 import numpy as np
@@ -27,6 +29,7 @@ from filprofiler._tracer import (
 )
 from filprofiler._testing import get_allocations, big, as_mb
 from filprofiler._ipython import run_with_profile
+from filprofiler.api import profile
 from pymalloc import pymalloc
 
 
@@ -40,16 +43,17 @@ def test_no_profiling():
 
 def test_temporary_profiling(tmpdir):
     """Profiling can be run temporarily."""
-    start_tracing(tmpdir)
-
+    # get_allocations() expects actual output in a subdirectory.
     def f():
         arr = np.ones((1024, 1024, 4), dtype=np.uint64)  # 32MB
+        del arr
+        return 1234
 
-    f()
-    stop_tracing(tmpdir)
+    result = profile(f, tmpdir / "output")
+    assert result == 1234
 
     # Allocations were tracked:
-    path = ((__file__, "f", 46), (numpy.core.numeric.__file__, "ones", ANY))
+    path = ((__file__, "f", 48), (numpy.core.numeric.__file__, "ones", ANY))
     allocations = get_allocations(tmpdir)
     assert match(allocations, {path: big}, as_mb) == pytest.approx(32, 0.1)
 
@@ -170,7 +174,10 @@ f()
     test_no_profiling()
 
 
-def test_profiling_disables_threadpools(tmpdir):
+@pytest.mark.parametrize(
+    "profile_func", [lambda f, tempdir: run_with_profile(f), profile,]
+)
+def test_profiling_disables_threadpools(tmpdir, profile_func):
     """
     Memory profiling disables thread pools, then restores them when done.
     """
@@ -183,12 +190,15 @@ def test_profiling_disables_threadpools(tmpdir):
     numexpr.set_num_threads(3)
     blosc.set_nthreads(3)
     with threadpoolctl.threadpool_limits(3, "blas"):
-        with run_with_profile():
+
+        def check():
             assert numexpr.set_num_threads(2) == 1
             assert blosc.set_nthreads(2) == 1
 
             for d in threadpoolctl.threadpool_info():
                 assert d["num_threads"] == 1, d
+
+        profile_func(check, tmpdir)
 
         # Resets when done:
         assert numexpr.set_num_threads(2) == 3
@@ -214,3 +224,38 @@ def test_profiling_without_blosc_and_numexpr(tmpdir):
     finally:
         del sys.modules["blosc"]
         del sys.modules["numexpr"]
+
+
+def test_subprocess(tmpdir):
+    """
+    Running a subprocess doesn't blow up.
+    """
+    start_tracing(tmpdir)
+    try:
+        output = check_output(["printf", "hello"])
+    finally:
+        stop_tracing(tmpdir)
+    assert output == b"hello"
+
+
+def return123():
+    return 123
+
+
+@pytest.mark.parametrize("mode", ["spawn", "forkserver", "fork"])
+def test_multiprocessing(tmpdir, mode):
+    """
+    Running a subprocess via multiprocessing in the various different modes
+    doesn't blow up.
+    """
+    # Non-tracing:
+    with multiprocessing.get_context(mode).Pool() as pool:
+        assert pool.apply((3).__add__, (4,)) == 7
+
+    # Tracing:
+    start_tracing(tmpdir)
+    try:
+        with multiprocessing.get_context(mode).Pool() as pool:
+            assert pool.apply((3).__add__, (4,)) == 7
+    finally:
+        stop_tracing(tmpdir)

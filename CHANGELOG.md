@@ -1,3 +1,47 @@
+# Fil 0.16.0 (2021-02-24)
+
+
+### Bugfixes
+
+- On Linux, use a more robust method of preloading the shared library (requires glibc 2.30+, i.e. a Linux distribution released in 2020 or later). ([#133](https://github.com/pythonspeed/filprofiler/issues/133))
+- Fixed in regression in Fil v0.15 that made it unusable on macOS. ([#135](https://github.com/pythonspeed/filprofiler/issues/135))
+- Fewer spurious warnings about launching subprocesses. ([#136](https://github.com/pythonspeed/filprofiler/issues/136))
+
+
+# Fil 0.15.0 (2021-02-18)
+
+
+### Features
+
+- Fil now supports profiling individual functions in normal Python scripts; previously this was only possible in Jupyter. ([#71](https://github.com/pythonspeed/filprofiler/issues/71))
+
+
+### Bugfixes
+
+- Fil now works better with subprocessses. It doesn't support memory tracking in subprocesses yet, but it doesn't break them either. ([#117](https://github.com/pythonspeed/filprofiler/issues/117))
+
+
+# Fil 0.14.1 (2021-01-15)
+
+
+### Features
+
+- Report memory stats when out-of-memory event is detected. ([#114](https://github.com/pythonspeed/filprofiler/issues/114))
+
+
+### Bugfixes
+
+- Correctly handle bad data from cgroups about memory limits, fixing erroneous out-of-memory caused by Docker. ([#113](https://github.com/pythonspeed/filprofiler/issues/113))
+
+
+# Fil 0.14.0 (2021-01-13)
+
+
+### Features
+
+- Out-of-memory detection should work in many more cases than before. ([#96](https://github.com/pythonspeed/filprofiler/issues/96))
+
+
 # Fil 0.13.1 (2020-11-30)
 
 

@@ -10,6 +10,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <sys/mman.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 // Macro to create the publicly exposed symbol:
 #ifdef __APPLE__
@@ -36,6 +38,7 @@ static int (*underlying_real_pthread_create)(pthread_t *thread,
                                              const pthread_attr_t *attr,
                                              void *(*start_routine)(void *),
                                              void *arg) = 0;
+static pid_t (*underlying_real_fork)(void) = 0;
 
 // Used on Linux to implement these APIs:
 extern void *_rjem_malloc(size_t length);
@@ -106,6 +109,28 @@ struct FunctionLocation {
   Py_ssize_t function_name_length;
 };
 
+// Implemented in the Rust library:
+extern uint64_t pymemprofile_add_function_location(const char* filename, size_t filename_length, const char* function_name,
+                                                   size_t function_length);
+extern void pymemprofile_start_call(uint16_t parent_line_number,
+                                    uint64_t function_id,
+                                    uint16_t line_number);
+extern void pymemprofile_finish_call();
+extern void pymemprofile_new_line_number(uint16_t line_number);
+extern void pymemprofile_reset(const char *path);
+extern void pymemprofile_start_tracking();
+extern void pymemprofile_stop_tracking();
+extern void pymemprofile_dump_peak_to_flamegraph(const char *path);
+extern void pymemprofile_add_allocation(size_t address, size_t length,
+                                        uint16_t line_number);
+extern void pymemprofile_free_allocation(size_t address);
+extern void pymemprofile_add_anon_mmap(size_t address, size_t length,
+                                       uint16_t line_number);
+extern void pymemprofile_free_anon_mmap(size_t address, size_t length);
+extern void *pymemprofile_get_current_callstack();
+extern void pymemprofile_set_current_callstack(void *callstack);
+extern void pymemprofile_clear_current_callstack();
+
 static void __attribute__((constructor)) constructor() {
   if (initialized) {
     return;
@@ -138,32 +163,27 @@ static void __attribute__((constructor)) constructor() {
     fprintf(stderr, "Couldn't load pthread_create(): %s\n", dlerror());
     exit(1);
   }
+  underlying_real_fork = dlsym(RTLD_NEXT, "fork");
+  if (!underlying_real_fork) {
+    fprintf(stderr, "Couldn't load fork(): %s\n", dlerror());
+    exit(1);
+  }
+
+  // Initialize Rust static state before we start doing any calls via malloc(),
+  // to ensure we don't get unpleasant reentrancy issues.
+  pymemprofile_reset("/tmp");
+
+  // Drop LD_PRELOAD and DYLD_INSERT_LIBRARIES so that subprocesses don't have
+  // this preloaded.
+  unsetenv("LD_PRELOAD");
+  // Enabling this breaks things. Don't trust CI being green, check this
+  // manually (see https://github.com/pythonspeed/filprofiler/issues/137).
+  // unsetenv("DYLD_INSERT_LIBRARIES");
 
   initialized = 1;
-  unsetenv("LD_PRELOAD");
-  // This seems to break things... revisit at some point.
-  // unsetenv("DYLD_INSERT_LIBRARIES");
 }
 
-// Implemented in the Rust library:
-extern void pymemprofile_start_call(uint16_t parent_line_number,
-                                    struct FunctionLocation *loc,
-                                    uint16_t line_number);
-extern void pymemprofile_finish_call();
-extern void pymemprofile_new_line_number(uint16_t line_number);
-extern void pymemprofile_reset();
-extern void pymemprofile_dump_peak_to_flamegraph(const char *path);
-extern void pymemprofile_add_allocation(size_t address, size_t length,
-                                        uint16_t line_number);
-extern void pymemprofile_free_allocation(size_t address);
-extern void pymemprofile_add_anon_mmap(size_t address, size_t length,
-                                       uint16_t line_number);
-extern void pymemprofile_free_anon_mmap(size_t address, size_t length);
-extern void *pymemprofile_get_current_callstack();
-extern void pymemprofile_set_current_callstack(void *callstack);
-extern void pymemprofile_clear_current_callstack();
-
-static void start_call(struct FunctionLocation *loc, uint16_t line_number) {
+static void start_call(uint64_t function_id, uint16_t line_number) {
   if (should_track_memory()) {
     set_will_i_be_reentrant(1);
     uint16_t parent_line_number = 0;
@@ -171,7 +191,7 @@ static void start_call(struct FunctionLocation *loc, uint16_t line_number) {
       PyFrameObject *f = current_frame->f_back;
       parent_line_number = PyCode_Addr2Line(f->f_code, f->f_lasti);
     }
-    pymemprofile_start_call(parent_line_number, loc, line_number);
+    pymemprofile_start_call(parent_line_number, function_id, line_number);
     set_will_i_be_reentrant(0);
   }
 }
@@ -193,32 +213,28 @@ fil_tracer(PyObject *obj, PyFrameObject *frame, int what, PyObject *arg) {
     current_frame = frame;
 
     /*
-      We want an efficient identifier for filename+fuction name. So we:
-
-      1. Incref the two string objects so they never get GC'ed.
-      2. Store references to the corresponding UTF8 strings on the code object
-         as extra info.
-
-      The pointer address of the resulting struct can be used as an
-      identifier.
+      We want an efficient identifier for filename+fuction name. So we register
+      the function + filename with some Rust code that gives back its ID, and
+      then store the ID. Due to bad API design, value 0 indicates "no result",
+      so we actually store the result + 1.
     */
-    struct FunctionLocation *loc = NULL;
+    uint64_t function_id = 0;
     assert(extra_code_index != -1);
     _PyCode_GetExtra((PyObject *)frame->f_code, extra_code_index,
-                     (void **)&loc);
-    if (loc == NULL) {
-      // Ensure the two string never get garbage collected;
-      Py_INCREF(frame->f_code->co_filename);
-      Py_INCREF(frame->f_code->co_name);
-      loc = REAL_IMPL(malloc)(sizeof(struct FunctionLocation));
-      loc->filename = PyUnicode_AsUTF8AndSize(frame->f_code->co_filename,
-                                              &loc->filename_length);
-      loc->function_name = PyUnicode_AsUTF8AndSize(frame->f_code->co_name,
-                                                   &loc->function_name_length);
+                     (void **)&function_id);
+    if (function_id == 0) {
+      Py_ssize_t filename_length, function_length;
+      const char* filename = PyUnicode_AsUTF8AndSize(frame->f_code->co_filename,
+                                                     &filename_length);
+      const char* function_name = PyUnicode_AsUTF8AndSize(frame->f_code->co_name,
+                                                          &function_length);
+      function_id = pymemprofile_add_function_location(filename, (uint64_t)filename_length, function_name, (uint64_t)function_length);
       _PyCode_SetExtra((PyObject *)frame->f_code, extra_code_index,
-                       (void *)loc);
+                       (void *)function_id + 1);
+    } else {
+      function_id -= 1;
     }
-    start_call(loc, frame->f_lineno);
+    start_call(function_id, frame->f_lineno);
     break;
   case PyTrace_RETURN:
     finish_call();
@@ -241,7 +257,7 @@ __attribute__((visibility("default"))) void fil_initialize_from_python() {
 
 /// Start memory tracing.
 __attribute__((visibility("default"))) void
-fil_start_tracing() {
+fil_start_tracking() {
   tracking_allocations = 1;
 }
 
@@ -254,7 +270,7 @@ fil_reset(const char *default_path) {
 }
 
 /// End memory tracing.
-__attribute__((visibility("default"))) void fil_shutting_down() {
+__attribute__((visibility("default"))) void fil_stop_tracking() {
   tracking_allocations = 0;
 }
 
@@ -281,7 +297,6 @@ fil_dump_peak_to_flamegraph(const char *path) {
 }
 
 // *** End APIs called by Python ***
-
 static void add_allocation(size_t address, size_t size) {
   uint16_t line_number = 0;
   PyFrameObject *f = current_frame;
@@ -298,6 +313,21 @@ static void add_anon_mmap(size_t address, size_t size) {
     line_number = PyCode_Addr2Line(f->f_code, f->f_lasti);
   }
   pymemprofile_add_anon_mmap(address, size, line_number);
+}
+
+// Disable memory tracking after fork() in the child.
+__attribute__((visibility("default"))) pid_t SYMBOL_PREFIX(fork)(void) {
+  static int already_printed = 0;
+  if (tracking_allocations && !already_printed) {
+    fprintf(stderr, "=fil-profile= WARNING: Fil does not (yet) support tracking memory in subprocesses.\n");
+    already_printed = 1;
+  }
+  pid_t result = underlying_real_fork();
+  if (result == 0) {
+    // We're the child.
+    fil_stop_tracking();
+  }
+  return result;
 }
 
 // Override memory-allocation functions:
@@ -492,4 +522,5 @@ DYLD_INTERPOSE(SYMBOL_PREFIX(aligned_alloc), aligned_alloc)
 #  endif
 DYLD_INTERPOSE(SYMBOL_PREFIX(posix_memalign), posix_memalign)
 DYLD_INTERPOSE(SYMBOL_PREFIX(pthread_create), pthread_create)
+DYLD_INTERPOSE(SYMBOL_PREFIX(fork), fork)
 #endif
