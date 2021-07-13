@@ -1,14 +1,20 @@
+use crate::python::get_runpy_path;
+
 use super::rangemap::RangeMap;
 use super::util::new_hashmap;
 use ahash::RandomState as ARandomState;
 use im::Vector as ImVector;
 use inferno::flamegraph;
 use itertools::Itertools;
-use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::{borrow::Cow, io::Write};
 use std::{collections::HashMap, io::Read};
 use std::{fs, io::Seek};
+
+extern "C" {
+    fn _exit(exit_code: std::os::raw::c_int);
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FunctionId(u32);
@@ -38,7 +44,7 @@ pub struct FunctionLocations {
 
 impl FunctionLocations {
     /// Create a new tracker.
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             functions: Vec::with_capacity(8192),
         }
@@ -151,64 +157,88 @@ impl Callstack {
         separator: &'static str,
     ) -> String {
         if self.calls.is_empty() {
-            "[No Python stack]".to_string()
+            return "[No Python stack]".to_string();
+        }
+        let calls: Vec<(CallSiteId, (&str, &str))> = self
+            .calls
+            .iter()
+            .map(|id| (*id, functions.get_function_and_filename(id.function)))
+            .collect();
+        let skip_prefix = if cfg!(feature = "production") {
+            0
         } else {
-            self.calls
-                .iter()
-                .map(|id| {
-                    let (function, filename) = functions.get_function_and_filename(id.function);
-                    if to_be_post_processed {
-                        // Get Python code.
-                        let code = crate::python::get_source_line(filename, id.line_number)
-                            .unwrap_or_else(|_| "".to_string());
-                        // Leading whitespace is dropped by SVG, so we'd like to
-                        // replace it with non-breaking space. However, inferno
-                        // trims whitespace
-                        // (https://github.com/jonhoo/inferno/blob/de3f7d94d4718bfee57655c1fddd4d2714bc78d0/src/flamegraph/merge.rs#L126)
-                        // and that causes incorrect "unsorted lines" errors
-                        // which I can't be bothered to fix right now, so for
-                        // now do hack where we shove in some other character
-                        // that can be fixed in post-processing.
-                        let code = code.replace(" ", "\u{12e4}");
-                        // Semicolons are used as separator in the flamegraph
-                        // input format, so need to replace them with some other
-                        // character. We use "full-width semicolon", and then
-                        // replace it back in post-processing.
-                        let code = code.replace(";", "\u{ff1b}");
-                        // The \u{2800} is to ensure we don't have empty lines,
-                        // and that whitespace doesn't get trimmed from start;
-                        // we'll get rid of this in post-processing.
-                        format!(
-                            "{filename}:{line} ({function});\u{2800}{code}",
-                            filename = filename,
-                            line = id.line_number,
-                            function = function,
-                            code = &code.trim_end(),
-                        )
-                    } else {
-                        format!(
-                            "{filename}:{line} ({function})",
-                            filename = filename,
-                            line = id.line_number,
-                            function = function,
-                        )
-                    }
-                })
-                .join(separator)
+            // Due to implementation details we have some runpy() frames at the
+            // start; remove them.
+            runpy_prefix_length(calls.iter())
+        };
+        calls
+            .into_iter()
+            .skip(skip_prefix)
+            .map(|(id, (function, filename))| {
+                if to_be_post_processed {
+                    // Get Python code.
+                    let code = crate::python::get_source_line(filename, id.line_number)
+                        .unwrap_or_else(|_| "".to_string());
+                    // Leading whitespace is dropped by SVG, so we'd like to
+                    // replace it with non-breaking space. However, inferno
+                    // trims whitespace
+                    // (https://github.com/jonhoo/inferno/blob/de3f7d94d4718bfee57655c1fddd4d2714bc78d0/src/flamegraph/merge.rs#L126)
+                    // and that causes incorrect "unsorted lines" errors
+                    // which I can't be bothered to fix right now, so for
+                    // now do hack where we shove in some other character
+                    // that can be fixed in post-processing.
+                    let code = code.replace(" ", "\u{12e4}");
+                    // Semicolons are used as separator in the flamegraph
+                    // input format, so need to replace them with some other
+                    // character. We use "full-width semicolon", and then
+                    // replace it back in post-processing.
+                    let code = code.replace(";", "\u{ff1b}");
+                    // The \u{2800} is to ensure we don't have empty lines,
+                    // and that whitespace doesn't get trimmed from start;
+                    // we'll get rid of this in post-processing.
+                    format!(
+                        "{filename}:{line} ({function});\u{2800}{code}",
+                        filename = filename,
+                        line = id.line_number,
+                        function = function,
+                        code = &code.trim_end(),
+                    )
+                } else {
+                    format!(
+                        "{filename}:{line} ({function})",
+                        filename = filename,
+                        line = id.line_number,
+                        function = function,
+                    )
+                }
+            })
+            .join(separator)
+    }
+}
+
+fn runpy_prefix_length(calls: std::slice::Iter<(CallSiteId, (&str, &str))>) -> usize {
+    let mut length = 0;
+    let runpy_path = get_runpy_path();
+    for (_, (_, filename)) in calls {
+        if *filename == runpy_path {
+            length += 1;
+        } else {
+            return length;
         }
     }
+    0
 }
 
 pub type CallstackId = u32;
 
 /// Maps Functions to integer identifiers used in CallStacks.
-struct CallstackInterner {
+pub struct CallstackInterner {
     max_id: CallstackId,
     callstack_to_id: HashMap<Callstack, u32, ARandomState>,
 }
 
 impl<'a> CallstackInterner {
-    fn new() -> Self {
+    pub fn new() -> Self {
         CallstackInterner {
             max_id: 0,
             callstack_to_id: new_hashmap(),
@@ -216,18 +246,18 @@ impl<'a> CallstackInterner {
     }
 
     /// Add a (possibly) new Function, returning its ID.
-    fn get_or_insert_id<F: FnOnce() -> ()>(
+    pub fn get_or_insert_id<F: FnOnce() -> ()>(
         &mut self,
-        callstack: &Callstack,
+        callstack: Cow<Callstack>,
         call_on_new: F,
     ) -> CallstackId {
         let max_id = &mut self.max_id;
-        if let Some(result) = self.callstack_to_id.get(callstack) {
+        if let Some(result) = self.callstack_to_id.get(&*callstack) {
             *result
         } else {
             let new_id = *max_id;
             *max_id += 1;
-            self.callstack_to_id.insert(callstack.clone(), new_id);
+            self.callstack_to_id.insert(callstack.into_owned(), new_id);
             call_on_new();
             new_id
         }
@@ -349,6 +379,10 @@ pub struct AllocationTracker {
     // Allocations that somehow disappeared. Not relevant for sampling profiler.
     #[cfg(not(feature = "production"))]
     missing_allocated_bytes: usize,
+
+    // free()/realloc() of unknown address. Not relevant for sampling profiler.
+    #[cfg(not(feature = "production"))]
+    failed_deallocations: usize,
 }
 
 impl<'a> AllocationTracker {
@@ -363,6 +397,7 @@ impl<'a> AllocationTracker {
             current_allocated_bytes: 0,
             peak_allocated_bytes: 0,
             missing_allocated_bytes: 0,
+            failed_deallocations: 0,
             default_path,
         }
     }
@@ -415,7 +450,9 @@ impl<'a> AllocationTracker {
     pub fn get_callstack_id(&mut self, callstack: &Callstack) -> CallstackId {
         let current_memory_usage = &mut self.current_memory_usage;
         self.interner
-            .get_or_insert_id(callstack, || current_memory_usage.push_back(0))
+            .get_or_insert_id(Cow::Borrowed(callstack), || {
+                current_memory_usage.push_back(0)
+            })
     }
 
     /// Add a new allocation based off the current callstack.
@@ -441,6 +478,14 @@ impl<'a> AllocationTracker {
                         "The allocation from this traceback disappeared:",
                         previous.callstack_id,
                     );
+                    self.print_traceback(
+                        "The current traceback that overwrote the disappearing allocation:",
+                        alloc.callstack_id,
+                    );
+                    eprintln!(
+                        "|= The current C/Rust backtrace: {:?}",
+                        backtrace::Backtrace::new()
+                    );
                 }
             }
         }
@@ -452,12 +497,21 @@ impl<'a> AllocationTracker {
         // Before we reduce memory, let's check if we've previously hit a peak:
         self.check_if_new_peak();
 
-        // Possibly this allocation doesn't exist; that's OK! It can if e.g. we
-        // didn't capture an allocation for some reason.
         if let Some(removed) = self.current_allocations.remove(&address) {
             self.remove_memory_usage(removed.callstack_id, removed.size());
             Some(removed.size())
         } else {
+            // This allocation doesn't exist; often this will be something
+            // allocated before Fil tracking was started, but it might also be a
+            // bug.
+            #[cfg(not(feature = "production"))]
+            if *crate::util::DEBUG_MODE {
+                self.failed_deallocations += 1;
+                eprintln!(
+                    "=fil-profile= Your program attempted to free an allocation at an address we don't know about:"
+                );
+                eprintln!("=| {:?}", backtrace::Backtrace::new());
+            }
             None
         }
     }
@@ -551,6 +605,9 @@ impl<'a> AllocationTracker {
             };
             if self.missing_allocated_bytes > 0 {
                 eprintln!("=fil-profile= WARNING: {:.2}% ({} bytes) of tracked memory somehow disappeared. If this is a small percentage you can just ignore this warning, since the missing allocations won't impact the profiling results. If the % is high, please run `export FIL_DEBUG=1` to get more output', re-run Fil on your script, and then file a bug report at https://github.com/pythonspeed/filprofiler/issues/new", self.missing_allocated_bytes as f64 * 100.0 / allocated_bytes as f64, self.missing_allocated_bytes);
+            }
+            if self.failed_deallocations > 0 {
+                eprintln!("=fil-profile= WARNING: Encountered {} deallocations of untracked allocations. A certain number are expected in normal operation, of allocations created before Fil started tracking, and even more if you're using the Fil API to turn tracking on and off.", self.failed_deallocations);
             }
         }
 
@@ -671,7 +728,9 @@ impl<'a> AllocationTracker {
             "Current allocations at out-of-memory time",
             false,
         );
-        std::process::exit(53);
+        unsafe {
+            _exit(53);
+        }
     }
 
     /// Validate internal state is in a good state. This won't pass until
@@ -790,6 +849,7 @@ mod tests {
     use im;
     use itertools::Itertools;
     use proptest::prelude::*;
+    use std::borrow::Cow;
     use std::collections::HashMap;
 
     proptest! {
@@ -802,6 +862,7 @@ mod tests {
 
         // Allocation sizes larger than 2 ** 31 are stored as MiBs, with some
         // loss of resolution.
+
         #[test]
         fn large_allocation(size in (HIGH_32BIT as usize)..(1 << 50)) {
             let allocation = Allocation::new(0, size as usize);
@@ -978,23 +1039,23 @@ mod tests {
         let mut interner = CallstackInterner::new();
 
         let mut new = false;
-        let id1 = interner.get_or_insert_id(&cs1, || new = true);
+        let id1 = interner.get_or_insert_id(Cow::Borrowed(&cs1), || new = true);
         assert!(new);
 
         new = false;
-        let id1b = interner.get_or_insert_id(&cs1b, || new = true);
+        let id1b = interner.get_or_insert_id(Cow::Borrowed(&cs1b), || new = true);
         assert!(!new);
 
         new = false;
-        let id2 = interner.get_or_insert_id(&cs2, || new = true);
+        let id2 = interner.get_or_insert_id(Cow::Borrowed(&cs2), || new = true);
         assert!(new);
 
         new = false;
-        let id3 = interner.get_or_insert_id(&cs3, || new = true);
+        let id3 = interner.get_or_insert_id(Cow::Borrowed(&cs3), || new = true);
         assert!(new);
 
         new = false;
-        let id3b = interner.get_or_insert_id(&cs3b, || new = true);
+        let id3b = interner.get_or_insert_id(Cow::Borrowed(&cs3b), || new = true);
         assert!(!new);
 
         assert_eq!(id1, id1b);
@@ -1014,35 +1075,44 @@ mod tests {
         let mut interner = CallstackInterner::new();
 
         let mut cs1 = Callstack::new();
-        let id0 = cs1.id_for_new_allocation(0, |cs| interner.get_or_insert_id(cs, || ()));
-        let id0b = cs1.id_for_new_allocation(0, |cs| interner.get_or_insert_id(cs, || ()));
+        let id0 =
+            cs1.id_for_new_allocation(0, |cs| interner.get_or_insert_id(Cow::Borrowed(&cs), || ()));
+        let id0b =
+            cs1.id_for_new_allocation(0, |cs| interner.get_or_insert_id(Cow::Borrowed(&cs), || ()));
         assert_eq!(id0, id0b);
 
         let fid1 = FunctionId::new(1u32);
 
         cs1.start_call(0, CallSiteId::new(fid1, 2));
-        let id1 = cs1.id_for_new_allocation(1, |cs| interner.get_or_insert_id(cs, || ()));
-        let id2 = cs1.id_for_new_allocation(2, |cs| interner.get_or_insert_id(cs, || ()));
-        let id1b = cs1.id_for_new_allocation(1, |cs| interner.get_or_insert_id(cs, || ()));
+        let id1 =
+            cs1.id_for_new_allocation(1, |cs| interner.get_or_insert_id(Cow::Borrowed(&cs), || ()));
+        let id2 =
+            cs1.id_for_new_allocation(2, |cs| interner.get_or_insert_id(Cow::Borrowed(&cs), || ()));
+        let id1b =
+            cs1.id_for_new_allocation(1, |cs| interner.get_or_insert_id(Cow::Borrowed(&cs), || ()));
         assert_eq!(id1, id1b);
         assert_ne!(id2, id0);
         assert_ne!(id2, id1);
 
         cs1.start_call(3, CallSiteId::new(fid1, 2));
-        let id3 = cs1.id_for_new_allocation(4, |cs| interner.get_or_insert_id(cs, || ()));
+        let id3 =
+            cs1.id_for_new_allocation(4, |cs| interner.get_or_insert_id(Cow::Borrowed(&cs), || ()));
         assert_ne!(id3, id0);
         assert_ne!(id3, id1);
         assert_ne!(id3, id2);
 
         cs1.finish_call();
-        let id2b = cs1.id_for_new_allocation(2, |cs| interner.get_or_insert_id(cs, || ()));
+        let id2b =
+            cs1.id_for_new_allocation(2, |cs| interner.get_or_insert_id(Cow::Borrowed(&cs), || ()));
         assert_eq!(id2, id2b);
-        let id1c = cs1.id_for_new_allocation(1, |cs| interner.get_or_insert_id(cs, || ()));
+        let id1c =
+            cs1.id_for_new_allocation(1, |cs| interner.get_or_insert_id(Cow::Borrowed(&cs), || ()));
         assert_eq!(id1, id1c);
 
         // Check for cache invalidation in start_call:
         cs1.start_call(1, CallSiteId::new(fid1, 1));
-        let id4 = cs1.id_for_new_allocation(1, |cs| interner.get_or_insert_id(cs, || ()));
+        let id4 =
+            cs1.id_for_new_allocation(1, |cs| interner.get_or_insert_id(Cow::Borrowed(&cs), || ()));
         assert_ne!(id4, id0);
         assert_ne!(id4, id1);
         assert_ne!(id4, id2);
@@ -1050,7 +1120,8 @@ mod tests {
 
         // Check for cache invalidation in finish_call:
         cs1.finish_call();
-        let id1d = cs1.id_for_new_allocation(1, |cs| interner.get_or_insert_id(cs, || ()));
+        let id1d =
+            cs1.id_for_new_allocation(1, |cs| interner.get_or_insert_id(Cow::Borrowed(&cs), || ()));
         assert_eq!(id1, id1d);
     }
 

@@ -13,6 +13,10 @@ itertools = "0.10.0"
 ahash = "0.7.0"
 derivative = "2.2.0"
 lazy_static = "1.4.0"
+backtrace = "0.3"
+once_cell = "1.7"
+libloading = "0.7"
+libc = "0.2"
 
 [dependencies.inferno]
 version = "0.10.3"
@@ -31,10 +35,4 @@ cgroups-rs = "0.2.3"
 
 [dev-dependencies]
 proptest = "1.0.0"
-
-[lib]
-name = "pymemprofile_api"
-
-[features]
-extension-module = ["pyo3/extension-module"]
-default = ["extension-module"]
+proc-maps = "0.1.8"

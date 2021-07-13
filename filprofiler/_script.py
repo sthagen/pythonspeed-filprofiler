@@ -85,6 +85,12 @@ PARSER.add_argument(
     help="Directory where the profiling results written",
 )
 PARSER.add_argument(
+    "--disable-oom-detection",
+    action="store_true",
+    default=False,
+    help="Disable the heuristic that tries to catch out-of-memory situations before they occur",
+)
+PARSER.add_argument(
     "--no-browser",
     action="store_true",
     help="Don't try to open the profiling report in a browser.",
@@ -92,13 +98,21 @@ PARSER.add_argument(
 subparsers = PARSER.add_subparsers(help="sub-command help")
 parser_run = subparsers.add_parser(
     "run",
-    help="Run a Python script or package",
+    help="Run a Python script or package with Fil enabled",
+    prefix_chars=[""],
+    add_help=False,
+)
+parser_python = subparsers.add_parser(
+    "python",
+    help="Run a Python script or package with Fil initially disabled",
     prefix_chars=[""],
     add_help=False,
 )
 parser_run.set_defaults(command="run")
 parser_run.add_argument("rest", nargs=REMAINDER)
-del subparsers, parser_run
+parser_python.set_defaults(command="python")
+parser_python.add_argument("rest", nargs=REMAINDER)
+del subparsers, parser_run, parser_python
 
 # Can't figure out if this is a standard path _everywhere_, but it definitely
 # exists on Ubuntu 18.04 and 20.04, Debian Buster, CentOS 8, and Arch.
@@ -143,6 +157,11 @@ def stage_1():
     if len(sys.argv) == 1:
         PARSER.print_help()
         sys.exit(0)
+
+    arguments = PARSER.parse_args()
+    if arguments.disable_oom_detection:
+        # See filpreload/src/lib.rs:
+        environ["__FIL_DISABLE_OOM_DETECTION"] = "1"
 
     # Initial status:
     environ["__FIL_STATUS"] = "launcher"
@@ -208,8 +227,8 @@ def stage_2():
             sys.exit(2)
         module = arguments.rest[1]
         sys.argv = [module] + arguments.rest[2:]
-        code = "run_module(module_name, run_name='__main__')"
-        globals_ = {"run_module": runpy.run_module, "module_name": module}
+        function = runpy.run_module
+        func_args = (module,)
     else:
         sys.argv = rest = arguments.rest
         if len(rest) == 0:
@@ -218,14 +237,10 @@ def stage_2():
         script = rest[0]
         # Make directory where script is importable:
         sys.path.insert(0, dirname(abspath(script)))
-        with open(script, "rb") as script_file:
-            code = compile(script_file.read(), script, "exec")
-        globals_ = {
-            "__file__": script,
-            "__name__": "__main__",
-            "__package__": None,
-            "__cached__": None,
-        }
+        function = runpy.run_path
+        func_args = (script,)
+
+    func_kwargs = {"run_name": "__main__"}
 
     # Only import here since we don't want the parent process accessing any of
     # the _filpread.so code.
@@ -244,7 +259,13 @@ def stage_2():
     if not exists(arguments.output_path):
         makedirs(arguments.output_path)
 
-    trace_until_exit(code, globals_, arguments.output_path, not arguments.no_browser)
+    trace_until_exit(
+        function,
+        func_args,
+        func_kwargs,
+        arguments.output_path,
+        not arguments.no_browser,
+    )
 
 
 if __name__ == "__main__":

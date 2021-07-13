@@ -13,7 +13,7 @@ from glob import glob
 from xml.etree import ElementTree
 
 import numpy.core.numeric
-from pampy import match, _ as ANY
+from pampy import match, _ as ANY, MatchError
 import pytest
 import psutil
 
@@ -193,13 +193,10 @@ def test_minus_m():
     script = (dir / "malloc.py").absolute()
     output_dir = profile("-m", "malloc", "--size", "50", cwd=dir)
     allocations = get_allocations(output_dir)
-    stripped_allocations = {k[3:]: v for (k, v) in allocations.items()}
     script = str(script)
     path = ((script, "<module>", 32), (script, "main", 28))
 
-    assert match(stripped_allocations, {path: big}, as_mb) == pytest.approx(
-        50 + 10, 0.1
-    )
+    assert match(allocations, {path: big}, as_mb) == pytest.approx(50 + 10, 0.1)
 
 
 def test_minus_m_minus_m():
@@ -225,13 +222,10 @@ def test_minus_m_minus_m():
         cwd=dir,
     )
     allocations = get_allocations(output_dir)
-    stripped_allocations = {k[3:]: v for (k, v) in allocations.items()}
     script = str(script)
     path = ((script, "<module>", 32), (script, "main", 28))
 
-    assert match(stripped_allocations, {path: big}, as_mb) == pytest.approx(
-        50 + 10, 0.1
-    )
+    assert match(allocations, {path: big}, as_mb) == pytest.approx(50 + 10, 0.1)
 
 
 def test_ld_preload_disabled_for_subprocesses():
@@ -311,6 +305,27 @@ def test_out_of_memory_slow_leak():
     assert match(allocations, {expected_alloc: big}, as_mb) > 100
 
 
+@pytest.mark.skipif(
+    shutil.which("systemd-run") is None or glibc_version() < (2, 30),
+    reason="systemd-run not found, or old systemd probably",
+)
+def test_out_of_memory_detection_disabled():
+    """
+    If out-of-memory detection is disabled, we won't catch problems, the OS will.
+    """
+    available_memory = psutil.virtual_memory().available
+    script = TEST_SCRIPTS / "oom-slow.py"
+    try:
+        check_call(
+            get_systemd_run_args(available_memory // 4)
+            + ["fil-profile", "--disable-oom-detection", "run", str(script)]
+        )
+    except CalledProcessError as e:
+        assert e.returncode == -9  # killed by OS
+    else:
+        assert False, "process succeeded?!"
+
+
 def get_systemd_run_args(available_memory):
     """
     Figure out if we're on system with cgroups v2, or not, and return
@@ -325,14 +340,16 @@ def get_systemd_run_args(available_memory):
         "--gid",
         str(os.getegid()),
         "-p",
-        f"MemoryLimit={available_memory // 2}B",
+        f"MemoryLimit={available_memory // 4}B",
+        "--scope",
+        "--same-dir",
     ]
     try:
         check_call(args + ["--user", "printf", "hello"])
-        args += ["--user", "--scope"]
+        args += ["--user"]
     except CalledProcessError:
         # cgroups v1 doesn't do --user :(
-        args = ["sudo", "--preserve-env=PATH"] + args + ["-t", "--same-dir"]
+        args = ["sudo", "--preserve-env=PATH"] + args
     return args
 
 
@@ -475,15 +492,24 @@ def test_jupyter(tmpdir):
 
     # Allocations were tracked:
     allocations = get_allocations(output_dir)
-    print(allocations)
     path = (
-        (re.compile("<ipython-input-3-.*"), "__magic_run_with_fil", 3),
-        (re.compile("<ipython-input-2-.*"), "alloc", 4),
+        (re.compile(".*ipy*"), "__magic_run_with_fil", 3),
+        (re.compile(".*ipy.*"), "alloc", 4),
         (numpy.core.numeric.__file__, "ones", ANY),
     )
     assert match(allocations, {path: big}, as_mb) == pytest.approx(48, 0.1)
+    actual_path = None
+    for key in allocations:
+        try:
+            match(key, path, lambda x: x)
+        except MatchError:
+            continue
+        else:
+            actual_path = key
+    assert actual_path != None
+    assert actual_path[0][0] != actual_path[1][0]  # code is in different cells
     path2 = (
-        (re.compile("<ipython-input-3-.*"), "__magic_run_with_fil", 2),
+        (re.compile(".*ipy.*"), "__magic_run_with_fil", 2),
         (numpy.core.numeric.__file__, "ones", ANY),
     )
     assert match(allocations, {path2: big}, as_mb) == pytest.approx(20, 0.1)
