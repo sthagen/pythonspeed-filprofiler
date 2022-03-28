@@ -1,6 +1,5 @@
 use crate::flamegraph::filter_to_useful_callstacks;
 use crate::flamegraph::write_flamegraphs;
-use crate::flamegraph::write_lines;
 use crate::python::get_runpy_path;
 
 use super::rangemap::RangeMap;
@@ -395,6 +394,10 @@ impl<FL: FunctionLocations> AllocationTracker<FL> {
         self.current_allocated_bytes
     }
 
+    pub fn get_peak_allocated_bytes(&self) -> usize {
+        self.peak_allocated_bytes
+    }
+
     pub fn get_allocation_size(&self, process: ProcessUid, address: usize) -> usize {
         if let Some(allocation) = self
             .current_allocations
@@ -409,7 +412,7 @@ impl<FL: FunctionLocations> AllocationTracker<FL> {
     }
 
     /// Check if a new peak has been reached:
-    fn check_if_new_peak(&mut self) {
+    pub fn check_if_new_peak(&mut self) {
         if self.current_allocated_bytes > self.peak_allocated_bytes {
             self.peak_allocated_bytes = self.current_allocated_bytes;
             self.peak_memory_usage
@@ -601,25 +604,14 @@ impl<FL: FunctionLocations> AllocationTracker<FL> {
         self.dump_to_flamegraph(path, true, "peak-memory", "Peak Tracked Memory Usage", true);
     }
 
-    fn write_lines(
+    pub fn to_lines(
         &self,
         peak: bool,
         to_be_post_processed: bool,
-        dest: &Path,
-    ) -> std::io::Result<()> {
-        let lines = self.to_lines(peak, to_be_post_processed);
-        write_lines(lines, dest)?;
-        Ok(())
-    }
-
-    fn to_lines(
-        &self,
-        peak: bool,
-        to_be_post_processed: bool,
-    ) -> impl Iterator<Item = String> + '_ {
+    ) -> impl ExactSizeIterator<Item = String> + '_ {
         let by_call = self.combine_callstacks(peak).into_iter();
         let id_to_callstack = self.interner.get_reverse_map();
-        let lines = by_call.map(move |(callstack_id, size)| {
+        by_call.map(move |(callstack_id, size)| {
             format!(
                 "{} {}",
                 id_to_callstack.get(&callstack_id).unwrap().as_string(
@@ -629,8 +621,7 @@ impl<FL: FunctionLocations> AllocationTracker<FL> {
                 ),
                 size,
             )
-        });
-        lines
+        })
     }
 
     fn dump_to_flamegraph(
@@ -679,7 +670,7 @@ impl<FL: FunctionLocations> AllocationTracker<FL> {
             subtitle,
             "bytes",
             to_be_post_processed,
-            |tbpp, dest| self.write_lines(peak, tbpp, dest),
+            |tbpp| self.to_lines(peak, tbpp),
         )
     }
 

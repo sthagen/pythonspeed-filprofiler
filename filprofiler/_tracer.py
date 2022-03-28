@@ -120,6 +120,12 @@ def trace_until_exit(function, args, kwargs, output_path: str, open_browser: boo
         print("=fil-profile= Wrote HTML report to " + index_path, file=sys.stderr)
         if open_browser:
             try:
+                print(
+                    "=fil-profile= Trying to open the report in a browser.",
+                    "In some cases this may print error messages, especially on macOS.",
+                    "You can ignore those, it's just garbage output from the browser.",
+                    file=sys.stderr,
+                )
                 webbrowser.open("file://" + os.path.abspath(index_path))
             except webbrowser.Error as e:
                 print(
@@ -156,6 +162,17 @@ def disable_thread_pools():
             return 1
 
     import threadpoolctl
+
+    # NumPy (really, BLAS) thread pool can allocate a lot of memory, or at
+    # least mmap() it, which leads to surprising results. See
+    # https://github.com/pythonspeed/filprofiler/issues/308. For now, just
+    # import here to not show that in flamegraph.
+    try:
+        import numpy
+
+        del numpy
+    except ImportError:
+        pass
 
     numexpr_threads = numexpr_set_num_threads(1)
     blosc_threads = blosc_set_nthreads(1)
