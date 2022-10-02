@@ -1,5 +1,17 @@
 # Release notes
 
+## Fil 2022.09.3 (2022-09-30)
+
+### Bugfixes
+
+- Complex flamegraphs should render faster. ([#427](https://github.com/pythonspeed/filprofiler/issues/427))
+
+## Fil 2022.09.2 (2022-09-29)
+
+### Bugfixes
+
+- Hopefully fixed segfault on macOS, on Python 3.7 and perhaps other versions. ([#412](https://github.com/pythonspeed/filprofiler/issues/412))
+
 ## Fil 2022.09.0 (2022-09-12)
 
 ### Features
